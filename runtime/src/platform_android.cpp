@@ -1,0 +1,1485 @@
+#include <cstdlib>
+// Android host (NativeActivity): memory (mmap at fixed addresses), pthreads, the app's window (ANativeWindow),
+// game controllers + touch, AAudio, the Vulkan loader and android surface, a signal crash handler and
+// android_main. Game data lives in the app's external files dir (see docs/ANDROID.md):
+//   <files>/analysis/{main,sdk}.bin   module images (tools/nso2bin.py)
+//   <files>/extract/romfs/...         the RomFS
+//   <files>/user/...                  saves
+//   <files>/config.txt                optional: resolution=WxH
+#include <aaudio/AAudio.h>
+#include <android/api-level.h>
+#include <android/log.h>
+#include <android/native_window.h>
+#include <android/window.h>
+#include <android_native_app_glue.h>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <jni.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <time.h>
+#include <malloc.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#define VK_NO_PROTOTYPES
+#define VK_USE_PLATFORM_ANDROID_KHR
+#include <vulkan/vulkan.h>
+#if defined(NX_CUSTOM_DRIVER)
+#include <adrenotools/driver.h>
+#endif
+
+#include <nx/game.h>
+#include <nx/runtime.h>
+
+#include "kernel.h"
+#include "platform.h"
+#include "platform_android.h"
+#if NX_NCE
+#include "nce/nce.h"
+#endif
+
+namespace nx::nvn {
+void pipeline_cache_save();
+}
+
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
+namespace nx {
+void boot();
+}
+
+namespace nx::plat {
+
+namespace {
+android_app* g_app = nullptr;
+std::string g_root;
+std::string g_internal_dir;  // ANativeActivity::internalDataPath (the imported GPU driver lives under it)
+std::atomic<ANativeWindow*> g_window{nullptr};
+std::atomic<uint64_t> g_window_gen{0};  // bumped for every new window
+std::atomic<bool> g_visible{false};
+}  // namespace
+
+// ---- memory ---------------------------------------------------------------------------------------------------
+
+bool reserve(uint64_t addr, uint64_t size) {
+    void* p = mmap(reinterpret_cast<void*>(addr), size, PROT_NONE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+    if (p == MAP_FAILED) return false;
+    if (uint64_t(p) != addr) {  // old kernels ignore the flag and treat addr as a hint
+        munmap(p, size);
+        return false;
+    }
+    return true;
+}
+
+bool commit(uint64_t addr, uint64_t size) {
+    uint64_t a = addr & ~0xFFFull, e = (addr + size + 0xFFF) & ~0xFFFull;
+    return mprotect(reinterpret_cast<void*>(a), e - a, PROT_READ | PROT_WRITE) == 0;
+}
+
+void decommit(uint64_t addr, uint64_t size) {
+    madvise(reinterpret_cast<void*>(addr), size, MADV_DONTNEED);
+    mprotect(reinterpret_cast<void*>(addr), size, PROT_NONE);
+}
+
+// ---- threads and time -----------------------------------------------------------------------------------------
+
+struct ThreadStart {
+    ThreadFn fn;
+    void* arg;
+};
+
+static void* thread_entry(void* p) {
+    if (const char* e = getenv("NX_MALLOC_TUNE"); !(e && e[0] == '0')) {
+        mallopt(M_BIONIC_ZERO_INIT, 1);
+    }
+    ThreadStart s = *static_cast<ThreadStart*>(p);
+    delete static_cast<ThreadStart*>(p);
+    s.fn(s.arg);
+    return nullptr;
+}
+
+void start_thread(ThreadFn fn, void* arg, size_t stack_size) {
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, stack_size);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    pthread_t t;
+    pthread_create(&t, &a, thread_entry, new ThreadStart{fn, arg});
+    pthread_attr_destroy(&a);
+}
+
+void exit_thread() { pthread_exit(nullptr); }
+void exit_process(int code) { _exit(code); }
+
+void sleep_ns(int64_t ns) {
+    timespec ts{time_t(ns / 1000000000), long(ns % 1000000000)};
+    nanosleep(&ts, nullptr);
+}
+
+// Wonder's job system yields after every job item and in its barriers (svc YieldThread; DEBUG.md #44). NX_YIELD=spin:
+// a short pause on the core instead of the scheduler (the main thread made ~52 voluntary context switches per frame
+// in course, PHASE3.md B5); unset or sched: sched_yield, as before.
+void yield() {
+    static const bool spin = [] {
+        const char* e = std::getenv("NX_YIELD");
+        return e && std::strcmp(e, "spin") == 0;
+    }();
+    if (!spin) {
+        sched_yield();
+        return;
+    }
+    for (int k = 0; k < 64; k++) asm volatile("yield" ::: "memory");
+}
+void set_thread_name(const char* name) { pthread_setname_np(pthread_self(), name); }
+int64_t current_thread_id() { return gettid(); }
+
+namespace {
+struct CpuMasks {
+    long num_cores = 0;
+    cpu_set_t big{};
+    cpu_set_t main_non_replay{};
+    cpu_set_t little{};
+    bool valid = false;
+};
+
+const CpuMasks& get_cpu_masks() {
+    static const CpuMasks masks = [] {
+        CpuMasks m{};
+        m.num_cores = sysconf(_SC_NPROCESSORS_CONF);
+        if (m.num_cores < 8) return m;
+        int n = int(std::min<long>(m.num_cores, CPU_SETSIZE));
+        unsigned long freqs[CPU_SETSIZE] = {};
+        unsigned long min_f = ~0ul, max_f = 0;
+        bool any_freq = false;
+        for (int i = 0; i < n; ++i) {
+            char path[96];
+            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
+            FILE* f = std::fopen(path, "r");
+            if (f) {
+                unsigned long khz = 0;
+                if (std::fscanf(f, "%lu", &khz) == 1 && khz > 0) {
+                    freqs[i] = khz;
+                    min_f = std::min(min_f, khz);
+                    max_f = std::max(max_f, khz);
+                    any_freq = true;
+                }
+                std::fclose(f);
+            }
+        }
+        CPU_ZERO(&m.big);
+        CPU_ZERO(&m.main_non_replay);
+        CPU_ZERO(&m.little);
+        if (any_freq && max_f > min_f) {
+            unsigned long threshold = min_f + (max_f - min_f) / 4;
+            int last_big = -1;
+            int big_count = 0;
+            for (int i = 0; i < n; ++i) {
+                if (freqs[i] > threshold) {
+                    CPU_SET(i, &m.big);
+                    last_big = i;
+                    big_count++;
+                } else {
+                    CPU_SET(i, &m.little);
+                }
+            }
+            if (CPU_COUNT(&m.big) > 0 && CPU_COUNT(&m.little) > 0) {
+                for (int i = 0; i < n; ++i) {
+                    if (big_count >= 2 && i == last_big) continue;
+                    CPU_SET(i, &m.main_non_replay);
+                }
+                m.valid = true;
+                return m;
+            }
+        }
+        // Fallback for 6+2 8-core SoCs if sysfs frequencies are unreadable
+        CPU_ZERO(&m.big);
+        CPU_ZERO(&m.main_non_replay);
+        CPU_ZERO(&m.little);
+        for (int i = 0; i < 6; ++i) {
+            CPU_SET(i, &m.little);
+            CPU_SET(i, &m.main_non_replay);
+        }
+        CPU_SET(6, &m.big);
+        CPU_SET(6, &m.main_non_replay);
+        CPU_SET(7, &m.big);
+        m.valid = true;
+        return m;
+    }();
+    return masks;
+}
+}  // namespace
+
+void pin_current_thread_to_big_cores(const char* thread_name) {
+    const CpuMasks& m = get_cpu_masks();
+    if (!m.valid) return;
+
+    int rc = sched_setaffinity(0, sizeof(cpu_set_t), &m.big);
+    if (rc != 0) {
+        __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to pin thread '%s': errno %d", thread_name, rc);
+    }
+}
+
+void pin_current_thread_to_core(int core_id, const char* thread_name) {
+    long num_cores = sysconf(_SC_NPROCESSORS_CONF);
+    if (core_id < 0 || core_id >= num_cores) return;
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+
+    int rc = sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+    if (rc != 0) {
+        __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to pin thread '%s' to Core %d: errno %d", thread_name, core_id, rc);
+    }
+}
+
+void pin_current_thread_to_little_cores(const char* thread_name) {
+    const CpuMasks& m = get_cpu_masks();
+    if (!m.valid) return;
+
+    int rc = sched_setaffinity(0, sizeof(cpu_set_t), &m.little);
+    if (rc != 0) {
+        __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to pin thread '%s' to Little Cores: errno %d", thread_name, rc);
+    }
+}
+
+void reset_current_thread_affinity(const char* thread_name) {
+    long num_cores = sysconf(_SC_NPROCESSORS_CONF);
+    if (num_cores <= 0) return;
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    for (int i = 0; i < num_cores; ++i) {
+        CPU_SET(i, &cpuset);
+    }
+
+    int rc = sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+    if (rc != 0) {
+        __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to reset affinity for thread '%s': errno %d", thread_name, rc);
+    }
+}
+
+void set_thread_priority(int priority) {
+    int rc = setpriority(PRIO_PROCESS, 0, priority);
+    if (rc != 0) {
+        __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to set thread priority %d: errno %d", priority, errno);
+    }
+}
+
+void pin_thread_tid_to_little_cores(int64_t tid) {
+    if (tid <= 0) return;
+    const CpuMasks& m = get_cpu_masks();
+    if (!m.valid) return;
+    (void)sched_setaffinity(static_cast<pid_t>(tid), sizeof(cpu_set_t), &m.little);
+    (void)setpriority(PRIO_PROCESS, static_cast<id_t>(tid), 0);
+}
+
+void pin_thread_tid_to_big_cores(int64_t tid, int priority) {
+    if (tid <= 0) return;
+    const CpuMasks& m = get_cpu_masks();
+    if (!m.valid) return;
+    const cpu_set_t* target = (priority > -10 && CPU_COUNT(&m.main_non_replay) > 0) ? &m.main_non_replay : &m.big;
+    (void)sched_setaffinity(static_cast<pid_t>(tid), sizeof(cpu_set_t), target);
+    (void)setpriority(PRIO_PROCESS, static_cast<id_t>(tid), priority);
+}
+
+// ---- sampling profiler (simpleperf is not always allowed on retail phones) ------------------------------------
+
+namespace {
+constexpr uint32_t kMaxSamples = 1u << 18;
+constexpr int kFrames = 12;
+struct Sample {
+    int32_t tid;
+    uint64_t guest_lr;
+    uint64_t pc[kFrames];  // host pc, lr, then return addresses from the frame-pointer chain
+};
+std::atomic<uint32_t> g_nsamples{0};
+Sample* g_samples = nullptr;
+const int64_t* g_prof_tids = nullptr;
+const uint64_t* const* g_prof_lr = nullptr;
+size_t g_prof_count = 0;
+
+void on_sample(int, siginfo_t*, void* uc) {
+    uint32_t i = g_nsamples.fetch_add(1, std::memory_order_relaxed);
+    if (i >= kMaxSamples) return;
+    Sample& s = g_samples[i];
+    const mcontext_t& m = static_cast<ucontext_t*>(uc)->uc_mcontext;
+    s.tid = gettid();
+    s.guest_lr = 0;
+    for (size_t k = 0; k < g_prof_count; k++)
+        if (g_prof_tids[k] == s.tid) s.guest_lr = *g_prof_lr[k];
+    std::memset(s.pc, 0, sizeof s.pc);
+    s.pc[0] = m.pc;
+    s.pc[1] = m.regs[30];
+    // Frame records (fp -> [prev fp, lr]) on this thread's stack only: between sp and sp + 256 MiB, going up.
+    uint64_t fp = m.regs[29], lo = m.sp, hi = m.sp + (256ull << 20);
+    for (int k = 2; k < kFrames && fp >= lo && fp < hi && (fp & 7) == 0; k++) {
+        const uint64_t* rec = reinterpret_cast<const uint64_t*>(fp);
+        s.pc[k] = rec[1];
+        if (rec[0] <= fp) break;
+        fp = rec[0];
+    }
+}
+}  // namespace
+
+bool profile(const int64_t* tids, const uint64_t* const* guest_lr, size_t count, int seconds, const std::string& path) {
+    if (!g_samples) g_samples = new Sample[kMaxSamples];
+    g_prof_tids = tids;
+    g_prof_lr = guest_lr;
+    g_prof_count = count;
+    g_nsamples = 0;
+    struct sigaction sa{};
+    sa.sa_sigaction = on_sample;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;  // never on a guest stack (native execution)
+    sigaction(SIGPROF, &sa, nullptr);
+    std::vector<timer_t> timers;
+    for (size_t k = 0; k < count; k++) {
+        // The thread's CPU-time clock (Linux: MAKE_THREAD_CPUCLOCK(tid, CPUCLOCK_SCHED)).
+        clockid_t clock = clockid_t((~uint32_t(tids[k]) << 3) | 6);
+        sigevent sev{};
+        sev.sigev_notify = SIGEV_THREAD_ID;
+        sev.sigev_signo = SIGPROF;
+        sev.sigev_notify_thread_id = int(tids[k]);
+        timer_t t;
+        if (timer_create(clock, &sev, &t) != 0) continue;
+        itimerspec its{{0, 1'000'000}, {0, 1'000'000}};
+        timer_settime(t, 0, &its, nullptr);
+        timers.push_back(t);
+    }
+    sleep_ns(int64_t(seconds) * 1'000'000'000);
+    for (timer_t t : timers) timer_delete(t);
+    sleep_ns(10'000'000);
+    g_prof_count = 0;
+    uint32_t n = std::min(g_nsamples.load(), kMaxSamples);
+    FILE* f = std::fopen(path.c_str(), "w");
+    if (!f) return false;
+    Dl_info self{};
+    dladdr(reinterpret_cast<void*>(&on_sample), &self);
+    for (uint32_t i = 0; i < n; i++) {
+        const Sample& s = g_samples[i];
+        std::fprintf(f, "%d %llx", s.tid, (unsigned long long)s.guest_lr);
+        for (int k = 0; k < kFrames && s.pc[k]; k++) {
+            Dl_info d{};
+            if (dladdr(reinterpret_cast<void*>(s.pc[k]), &d) && d.dli_fbase) {
+                const char* name = d.dli_fbase == self.dli_fbase ? "self" : d.dli_fname;
+                const char* slash = std::strrchr(name, '/');
+                std::fprintf(f, " %s:%llx", slash ? slash + 1 : name,
+                             (unsigned long long)(s.pc[k] - uint64_t(d.dli_fbase)));
+            } else {
+                std::fprintf(f, " ?:%llx", (unsigned long long)s.pc[k]);
+            }
+        }
+        std::fputc('\n', f);
+    }
+    std::fclose(f);
+    return true;
+}
+
+uint64_t monotonic_ns() {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+}
+
+// ---- files and output -----------------------------------------------------------------------------------------
+
+FILE* fopen_utf8(const std::string& path, const char* mode) { return std::fopen(path.c_str(), mode); }
+int64_t ftell64(FILE* f) { return ftello(f); }
+int fseek64(FILE* f, int64_t off, int origin) { return fseeko(f, off, origin); }
+uint64_t read_at(FILE* f, int64_t off, void* buf, uint64_t size) {
+    // A size that does not fit ssize_t (the game passes -1) reads nothing, as fread did (and the game expects).
+    if (size > uint64_t(SSIZE_MAX)) return 0;
+    int fd = fileno(f);
+    uint64_t done = 0;
+    while (done < size) {
+        ssize_t n = pread(fd, static_cast<uint8_t*>(buf) + done, size_t(size - done), off + int64_t(done));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        done += uint64_t(n);
+    }
+    return done;
+}
+bool make_dirs(const std::string& path) {
+    std::error_code ec;
+    std::filesystem::create_directories(path, ec);
+    return !ec;
+}
+
+void log_line(const char* line) { __android_log_write(ANDROID_LOG_INFO, nx::game::kInfo.id, line); }
+
+std::string data_root() { return g_root; }
+
+const char* get_pipeline_cache_path() {
+    static std::string path;
+    if (path.empty() && g_app && g_app->activity && g_app->activity->internalDataPath) {
+        path = std::string(g_app->activity->internalDataPath) + "/vk_pipeline_cache.bin";
+    }
+    return path.empty() ? nullptr : path.c_str();
+}
+
+// The device's locale (Settings > System > Languages) as "es-MX".
+std::string system_language() {
+    if (!g_app || !g_app->config) return "";
+    char lang[2] = {}, country[2] = {};
+    AConfiguration_getLanguage(g_app->config, lang);
+    AConfiguration_getCountry(g_app->config, country);
+    if (!lang[0]) return "";
+    std::string s(lang, lang[1] ? 2 : 1);
+    if (country[0]) s += "-" + std::string(country, country[1] ? 2 : 1);
+    return s;
+}
+
+std::string setting(const std::string& key) {
+    std::ifstream f(g_root + "/config.txt");
+    std::string line;
+    while (std::getline(f, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        auto eq = line.find('=');
+        if (eq != std::string::npos && line.substr(0, eq) == key) return line.substr(eq + 1);
+    }
+    return {};
+}
+
+// ---- window ---------------------------------------------------------------------------------------------------
+
+// The window handed out stays valid for good (we hold a reference): Android destroys the activity's window when
+// the app goes to the background or the screen locks (APP_CMD_TERM_WINDOW), and until then we wait for one.
+void* create_window() {
+    ANativeWindow* w;
+    while (!(w = g_window.load())) sleep_ns(10'000'000);
+    ANativeWindow_acquire(w);
+    return w;
+}
+
+void release_window(void* w) { ANativeWindow_release(static_cast<ANativeWindow*>(w)); }
+
+uint64_t window_generation() { return g_window_gen; }
+
+ANativeWindow* android_window() { return g_window.load(); }  // platform_android.h
+
+bool window_minimized() { return !g_visible || !g_window; }
+
+void screen_size(uint32_t& w, uint32_t& h) {
+    ANativeWindow* win = static_cast<ANativeWindow*>(create_window());
+    int32_t a = ANativeWindow_getWidth(win), b = ANativeWindow_getHeight(win);
+    ANativeWindow_release(win);
+    w = uint32_t(std::max(a, b));  // landscape
+    h = uint32_t(std::min(a, b));
+}
+
+// The render size: resolution=WxH if set, else the screen's size times the render scale (render_scale=0.5..1, or
+// the GPU's default), never taller than 1080 (the game's art is made for 720p/1080p; more only costs GPU time).
+void window_size(uint32_t& w, uint32_t& h) {
+    uint32_t sw = 0, sh = 0;
+    screen_size(sw, sh);
+    if (!sw || !sh) { w = 1280; h = 720; return; }
+
+    std::string nr = setting("NX_RES");
+    std::string res = setting("RESOLUTION");
+    std::string r = setting("resolution");
+    std::string hud1080 = setting("NX_HUD_1080");
+    const uint32_t ui_h = (hud1080 == "1") ? 1080u : 720u;
+
+    auto parse_target_h = [ui_h](const std::string& s) -> uint32_t {
+        if (s == "360p" || s == "360") return ui_h;
+        if (s == "480p" || s == "480") return ui_h;
+        if (s == "540p" || s == "540") return ui_h;
+        if (s == "720p" || s == "720") return ui_h;
+        if (s == "1080p" || s == "1080") return 1080;
+        unsigned cw = 0, ch = 0;
+        if (!s.empty() && std::sscanf(s.c_str(), "%ux%u", &cw, &ch) == 2 && ch) return ch;
+        return 0;
+    };
+
+    uint32_t target_h = parse_target_h(nr);
+    if (!target_h) target_h = parse_target_h(res);
+    if (!target_h) target_h = parse_target_h(r);
+
+    if (target_h) {
+        float scale = float(target_h) / float(sh);
+        w = uint32_t(float(sw) * scale + 0.5f) & ~1u;
+        h = target_h & ~1u;
+        return;
+    }
+    std::string rs = setting("render_scale");
+    float scale = rs.empty() ? default_render_scale() : std::strtof(rs.c_str(), nullptr);
+    scale = std::clamp(scale, 0.25f, 1.0f);
+    scale = std::min(scale, 1080.0f / float(sh));
+    w = uint32_t(float(sw) * scale + 0.5f) & ~1u;
+    h = uint32_t(float(sh) * scale + 0.5f) & ~1u;
+}
+
+// A GPU tier from the Vulkan device name (queried once, before the game starts its renderer): current Adreno 7xx
+// and 8xx, Mali-G7xx and newer, Immortalis, Xclipse render at 1; Adreno 6xx at 0.85; anything older at 2/3
+// (about 720p, the Switch's handheld resolution).
+float default_render_scale() {
+    static float scale = [] {
+        auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(vulkan_get_instance_proc_addr());
+        if (!gipa) return 2.0f / 3;
+        auto create = reinterpret_cast<PFN_vkCreateInstance>(gipa(nullptr, "vkCreateInstance"));
+        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+        app.apiVersion = VK_API_VERSION_1_1;
+        VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+        ci.pApplicationInfo = &app;
+        VkInstance inst = VK_NULL_HANDLE;
+        if (!create || create(&ci, nullptr, &inst) != VK_SUCCESS) return 2.0f / 3;
+        auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(gipa(inst, "vkEnumeratePhysicalDevices"));
+        auto props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(gipa(inst, "vkGetPhysicalDeviceProperties"));
+        auto destroy = reinterpret_cast<PFN_vkDestroyInstance>(gipa(inst, "vkDestroyInstance"));
+        uint32_t n = 1;
+        VkPhysicalDevice pd = VK_NULL_HANDLE;
+        float s = 2.0f / 3;
+        if (enumerate(inst, &n, &pd) >= 0 && n && pd) {
+            VkPhysicalDeviceProperties p{};
+            props(pd, &p);
+            std::string name = p.deviceName;
+            int adreno = 0, mali = 0;
+            std::sscanf(name.c_str() + (name.find("Adreno") != std::string::npos ? name.find("Adreno") : name.size()),
+                        "Adreno (TM) %d", &adreno);
+            if (auto m = name.find("Mali-G"); m != std::string::npos) std::sscanf(name.c_str() + m, "Mali-G%d", &mali);
+            if (adreno >= 700 || mali >= 710 || name.find("Immortalis") != std::string::npos ||
+                name.find("Xclipse") != std::string::npos)
+                s = 1.0f;
+            else if (adreno >= 610 || mali >= 76)
+                s = 0.85f;
+            nx::log("gpu: %s -> default render scale %.2f", p.deviceName, s);
+        }
+        destroy(inst, nullptr);
+        return s;
+    }();
+    return scale;
+}
+
+// ---- Vulkan ---------------------------------------------------------------------------------------------------
+
+#if defined(NX_CUSTOM_DRIVER)
+// A GPU driver the user imported (the launcher's "Import GPU driver", e.g. Turnip for Adreno or custom/PanVK for Mali),
+// opened with libadrenotools in place of the system driver, or directly via dlopen for standalone ICDs (Mali/PanVK).
+// <files>/gpu_driver/active.txt holds the driver's file name; without it, or with NX_SYSTEM_DRIVER=1 in config.txt,
+// or if the driver fails to open, the system libvulkan.so is used.
+static void* g_custom_gipa = nullptr;
+
+void* open_custom_vulkan() {
+    if (const char* e = getenv("NX_SYSTEM_DRIVER"); e && e[0] == '1') {
+        nx::log("gpu driver: NX_SYSTEM_DRIVER=1 set, using system driver");
+        return nullptr;
+    }
+
+    std::string dir;
+    if (const char* env_d = getenv("NX_GPU_DRIVER_DIR"); env_d && env_d[0]) {
+        dir = env_d;
+    } else if (!g_internal_dir.empty()) {
+        dir = g_internal_dir + "/gpu_driver";
+    } else if (g_app && g_app->activity && g_app->activity->internalDataPath) {
+        dir = std::string(g_app->activity->internalDataPath) + "/gpu_driver";
+    } else if (const char* env_int = getenv("NX_INTERNAL_DIR"); env_int && env_int[0]) {
+        dir = std::string(env_int) + "/gpu_driver";
+    }
+    if (dir.empty()) {
+        nx::log("gpu driver: internal directory unknown, using system driver");
+        return nullptr;
+    }
+    if (dir.back() != '/') dir += '/';
+
+    std::string name;
+    if (const char* env_n = getenv("NX_GPU_DRIVER_NAME"); env_n && env_n[0]) {
+        name = env_n;
+    } else {
+        std::ifstream f(dir + "active.txt");
+        std::getline(f, name);
+    }
+    while (!name.empty() && (name.back() == '\r' || name.back() == '\n' || name.back() == ' ')) name.pop_back();
+    if (name.empty() || name == "system" || name == "default") {
+        nx::log("gpu driver: active driver empty/system, using system driver");
+        return nullptr;
+    }
+
+    std::string full_path = dir + name;
+    if (access(full_path.c_str(), R_OK) != 0) {
+        nx::log("gpu driver: active driver not readable: %s (errno %d)", full_path.c_str(), errno);
+        return nullptr;
+    }
+
+    // Determine whether this driver is a Mali / PanVK / Mesa ICD
+    bool is_mali_driver = false;
+    std::string lower_name = name;
+    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+    if (lower_name.find("pan") != std::string::npos ||
+        lower_name.find("mali") != std::string::npos ||
+        lower_name.find("bifrost") != std::string::npos ||
+        lower_name.find("valhall") != std::string::npos ||
+        lower_name.find("midgard") != std::string::npos) {
+        is_mali_driver = true;
+    }
+
+    {
+        std::ifstream meta_file(dir + "meta.json");
+        if (meta_file.is_open()) {
+            std::string meta_content((std::istreambuf_iterator<char>(meta_file)),
+                                      std::istreambuf_iterator<char>());
+            std::string lower_meta = meta_content;
+            std::transform(lower_meta.begin(), lower_meta.end(), lower_meta.begin(), ::tolower);
+            if (lower_meta.find("panvk") != std::string::npos ||
+                lower_meta.find("panfrost") != std::string::npos ||
+                lower_meta.find("mali") != std::string::npos) {
+                is_mali_driver = true;
+            }
+        }
+    }
+
+    void* h = nullptr;
+    void* gipa = nullptr;
+
+    if (is_mali_driver) {
+        nx::log("gpu driver: opening Mali/PanVK ICD directly: %s", full_path.c_str());
+        h = dlopen(full_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (h) {
+            gipa = dlsym(h, "vk_icdGetInstanceProcAddr");
+            if (!gipa) gipa = dlsym(h, "vkGetInstanceProcAddr");
+            if (gipa) {
+                nx::log("gpu driver: direct Mali ICD opened successfully, gipa=%p", gipa);
+                g_custom_gipa = gipa;
+                return h;
+            } else {
+                nx::log("gpu driver: direct dlopen succeeded but neither vk_icdGetInstanceProcAddr nor vkGetInstanceProcAddr found");
+                dlclose(h);
+                h = nullptr;
+            }
+        } else {
+            nx::log("gpu driver: direct dlopen of %s failed: %s", full_path.c_str(), dlerror());
+        }
+    }
+
+    // Try adrenotools for Adreno/Turnip or as fallback
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void*>(&open_custom_vulkan), &info) && info.dli_fname) {
+        std::string libdir = info.dli_fname;
+        libdir = libdir.substr(0, libdir.rfind('/') + 1);
+        nx::log("gpu driver: trying adrenotools for %s (hooks in %s)", full_path.c_str(), libdir.c_str());
+        h = adrenotools_open_libvulkan(RTLD_NOW | RTLD_LOCAL, ADRENOTOOLS_DRIVER_CUSTOM, nullptr, libdir.c_str(),
+                                       dir.c_str(), name.c_str(), nullptr, nullptr);
+        if (h) {
+            gipa = dlsym(h, "vkGetInstanceProcAddr");
+            if (!gipa) gipa = dlsym(h, "vk_icdGetInstanceProcAddr");
+            if (gipa) {
+                nx::log("gpu driver: adrenotools custom driver opened successfully, gipa=%p", gipa);
+                g_custom_gipa = gipa;
+                return h;
+            } else {
+                nx::log("gpu driver: adrenotools opened library but no GIPA found");
+                dlclose(h);
+                h = nullptr;
+            }
+        } else {
+            nx::log("gpu driver: adrenotools returned null");
+        }
+    }
+
+    // Generic direct dlopen fallback if neither was successful
+    if (!h) {
+        nx::log("gpu driver: trying generic direct dlopen fallback: %s", full_path.c_str());
+        h = dlopen(full_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (h) {
+            gipa = dlsym(h, "vkGetInstanceProcAddr");
+            if (!gipa) gipa = dlsym(h, "vk_icdGetInstanceProcAddr");
+            if (gipa) {
+                nx::log("gpu driver: generic direct dlopen succeeded, gipa=%p", gipa);
+                g_custom_gipa = gipa;
+                return h;
+            } else {
+                nx::log("gpu driver: generic direct dlopen has no GIPA symbol");
+                dlclose(h);
+                h = nullptr;
+            }
+        } else {
+            nx::log("gpu driver: generic direct dlopen of %s failed: %s", full_path.c_str(), dlerror());
+        }
+    }
+
+    nx::log("gpu driver: %s", h ? "custom driver opened" : "failed, the system driver is used");
+    return h;
+}
+#endif
+
+void* vulkan_get_instance_proc_addr() {
+    static void* gipa = []() -> void* {  // once: the custom driver is opened only once
+#if defined(NX_CUSTOM_DRIVER)
+        void* custom_lib = open_custom_vulkan();
+        if (custom_lib && g_custom_gipa) {
+            return g_custom_gipa;
+        }
+#endif
+        nx::log("gpu driver: loading system libvulkan.so");
+        void* lib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+        if (!lib) {
+            nx::log("gpu driver: failed to open system libvulkan.so: %s", dlerror());
+            return nullptr;
+        }
+        void* p = dlsym(lib, "vkGetInstanceProcAddr");
+        if (!p) p = dlsym(lib, "vk_icdGetInstanceProcAddr");
+        return p;
+    }();
+    return gipa;
+}
+
+const char* vulkan_surface_extension() { return VK_KHR_ANDROID_SURFACE_EXTENSION_NAME; }
+
+int vulkan_create_surface(void* instance, void* native_window, uint64_t* surface, void* gipa) {
+    ANativeWindow* win = static_cast<ANativeWindow*>(native_window);
+    const char* fsr_env = std::getenv("NX_FSR");
+    const std::string fsr_cfg = setting("NX_FSR");
+    const bool fsr_enabled = (fsr_env && fsr_env[0] == '1') || fsr_cfg == "1";
+    uint32_t rw = 0, rh = 0;
+    window_size(rw, rh);
+    if (win && rw && rh && !fsr_enabled) {
+        int32_t cur_w = ANativeWindow_getWidth(win), cur_h = ANativeWindow_getHeight(win);
+        bool portrait = cur_w < cur_h;
+        int32_t bw = int32_t(portrait ? std::min(rw, rh) : std::max(rw, rh));
+        int32_t bh = int32_t(portrait ? std::max(rw, rh) : std::min(rw, rh));
+        int r_geom = ANativeWindow_setBuffersGeometry(win, bw, bh, 0);
+        nx::log("android: setBuffersGeometry %dx%d (screen %dx%d) -> %d", bw, bh, cur_w, cur_h, r_geom);
+    }
+    auto create = reinterpret_cast<PFN_vkCreateAndroidSurfaceKHR>(reinterpret_cast<PFN_vkGetInstanceProcAddr>(gipa)(
+        static_cast<VkInstance>(instance), "vkCreateAndroidSurfaceKHR"));
+    VkAndroidSurfaceCreateInfoKHR ci{VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR};
+    ci.window = win;
+    VkSurfaceKHR s = VK_NULL_HANDLE;
+    VkResult r = create(static_cast<VkInstance>(instance), &ci, nullptr, &s);
+    *surface = reinterpret_cast<uint64_t>(s);
+    return r;
+}
+
+}  // namespace nx::plat
+
+// ---- crash handler and entry ----------------------------------------------------------------------------------
+
+namespace nx::nvn {
+void log_recent_passes();  // nvn_renderpass.cpp: the last render passes begun
+}
+
+namespace {
+
+struct sigaction g_previous[32];  // the handlers before ours (debuggerd's)
+
+void crash(int sig, siginfo_t* info, void* uc) {
+    if ((sig == SIGSEGV || sig == SIGBUS) && nx::plat::write_watch_fault(info->si_addr)) return;  // write_watch.cpp
+    nx::log("CRASH: signal %d, fault address %p", sig, info->si_addr);
+#if NX_NCE
+    // In the game's own code: its registers are in the signal's context, not in the thread's CPU.
+    if (nx::self_thread()) {
+        static nx::CPU fault;
+        uint64_t pc = 0;
+        if (nx::nce::guest_fault_context(uc, fault, pc)) {
+            nx::log("  in guest code at %s, lr %s, sp %llx", nx::describe(pc).c_str(), nx::describe(fault.x[30]).c_str(),
+                    (unsigned long long)fault.x[31]);
+            for (int k = 0; k < 32; k += 4)
+                nx::log("  x%-2d %016llx %016llx %016llx %016llx", k, (unsigned long long)fault.x[k],
+                        (unsigned long long)fault.x[k + 1], (unsigned long long)fault.x[k + 2], (unsigned long long)fault.x[k + 3]);
+            nx::backtrace(fault);
+        }
+    }
+#endif
+    if (nx::self_thread()) {
+        nx::CPU& c = nx::current_cpu();
+        nx::log("  guest lr %s  sp %llx", nx::describe(c.x[30]).c_str(), (unsigned long long)c.x[31]);
+        for (int k = 0; k < 32; k += 4)
+            nx::log("  x%-2d %016llx %016llx %016llx %016llx", k, (unsigned long long)c.x[k],
+                    (unsigned long long)c.x[k + 1], (unsigned long long)c.x[k + 2], (unsigned long long)c.x[k + 3]);
+        nx::backtrace(c);
+        nx::log_recent_files();
+        nx::nvn::log_recent_passes();
+    }
+    // Hand the signal to the previous handler, Android's debuggerd: it logs the host backtrace (a tombstone).
+    const struct sigaction& prev = g_previous[sig];
+    if (prev.sa_flags & SA_SIGINFO) {
+        if (prev.sa_sigaction) prev.sa_sigaction(sig, info, uc);
+    } else if (prev.sa_handler != SIG_DFL && prev.sa_handler != SIG_IGN && prev.sa_handler) {
+        prev.sa_handler(sig);
+    }
+    _exit(128 + sig);
+}
+
+void game_thread(void*) {
+    nx::plat::pin_thread_tid_to_big_cores(nx::plat::current_thread_id(), -4);
+    nx::plat::perf_hint_thread();
+    try {
+        nx::boot();
+    } catch (const nx::LongJmp& j) {
+        nx::fatal("longjmp to buffer %llx with no setjmp frame", (unsigned long long)j.buf);
+    } catch (const std::exception& e) {
+        nx::fatal("host exception: %s", e.what());
+    }
+}
+
+void request_immersive();  // below: runs on the UI thread
+
+// The panel's refresh while the game shows (Android 11+): 60 Hz, the rate of our vsync event (hle_vi.cpp) and the
+// most the game presents. A 90 Hz panel (Lenovo Tab M11) showed a 30 fps frame for 3 refreshes or, when a present
+// landed next to a refresh, 2 or 4: uneven motion in films and cutscenes. NX_WINDOW_HZ=<hz>: another rate, 0: leave
+// the panel's own.
+void request_frame_rate(ANativeWindow* w) {
+    // Android 12+: the switch even when it is not seamless (60 <-> 90 Hz on the Tab M11 is not: the plain request
+    // was accepted and ignored); Android 11: the plain request.
+    using SetFrameRate = int32_t (*)(ANativeWindow*, float, int8_t);
+    using SetFrameRateStrategy = int32_t (*)(ANativeWindow*, float, int8_t, int8_t);
+    static void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+    static const auto set = reinterpret_cast<SetFrameRate>(lib ? dlsym(lib, "ANativeWindow_setFrameRate") : nullptr);
+    static const auto set_always = reinterpret_cast<SetFrameRateStrategy>(
+        lib ? dlsym(lib, "ANativeWindow_setFrameRateWithChangeStrategy") : nullptr);
+    const char* e = getenv("NX_WINDOW_HZ");
+    float hz = e ? float(std::atof(e)) : 0.0f;
+    if (!e) {
+        const char* cap = getenv("NX_FPS_CAP");
+        const std::string cap_cfg = (cap && *cap) ? std::string(cap) : nx::plat::setting("NX_FPS_CAP");
+        const int fps = cap_cfg.empty() ? 60 : std::atoi(cap_cfg.c_str());
+        hz = (fps >= 24 && fps <= 120) ? float(fps) : 60.0f;
+    }
+    if (!w || hz <= 0) return;
+    if (!set && !set_always) return nx::log("android: no ANativeWindow_setFrameRate (Android 10 or older): the panel's own rate");
+    int32_t r = set_always ? set_always(w, hz, 1 /* COMPATIBILITY_FIXED_SOURCE */, 1 /* CHANGE_FRAME_RATE_ALWAYS */)
+                           : set(w, hz, 1);
+    nx::log("android: window frame rate %.0f Hz requested (%d%s)", double(hz), int(r), set_always ? ", even if not seamless" : "");
+}
+
+void on_cmd(android_app* app, int32_t cmd) {
+    using namespace nx::plat;
+    switch (cmd) {
+        case APP_CMD_INIT_WINDOW: {
+            g_window = app->window;
+            g_window_gen++;
+            g_visible = true;
+            const char* fsr = std::getenv("NX_FSR");
+            const std::string fsr_cfg = setting("NX_FSR");
+            if (!((fsr && fsr[0] == '1') || fsr_cfg == "1")) {
+                uint32_t rw = 0, rh = 0;
+                window_size(rw, rh);
+                if (rw && rh && app->window) {
+                    int32_t sw = ANativeWindow_getWidth(app->window);
+                    int32_t sh = ANativeWindow_getHeight(app->window);
+                    bool portrait = sw > 0 && sh > 0 && sw < sh;
+                    int32_t bw = int32_t(portrait ? std::min(rw, rh) : std::max(rw, rh));
+                    int32_t bh = int32_t(portrait ? std::max(rw, rh) : std::min(rw, rh));
+                    ANativeWindow_setBuffersGeometry(app->window, bw, bh, 0);
+                    nx::log("android: ANativeWindow buffer geometry set to %dx%d (screen %dx%d)", bw, bh, sw, sh);
+                }
+            }
+            request_frame_rate(app->window);
+            request_immersive();
+            break;
+        }
+        case APP_CMD_TERM_WINDOW:  // the window goes away once this returns
+            g_window = nullptr;
+            g_visible = false;
+            nx::nvn::pipeline_cache_save();
+            break;
+        case APP_CMD_GAINED_FOCUS:
+            g_visible = g_window != nullptr;
+            request_immersive();  // bars shown by a swipe hide again
+            break;
+        case APP_CMD_LOST_FOCUS:
+            break;
+        case APP_CMD_PAUSE:  // home, app switcher, screen off: the game holds (no window), so does its sound
+            audio_pause(true);
+            nx::nvn::pipeline_cache_save();
+            break;
+        case APP_CMD_STOP:
+        case APP_CMD_DESTROY:
+            nx::nvn::pipeline_cache_save();
+            break;
+        case APP_CMD_RESUME:
+            audio_pause(false);
+            break;
+    }
+}
+
+}  // namespace
+
+// ---- immersive mode: the status and navigation bars hidden (a swipe from an edge shows them for a moment) --------
+// Only the UI thread may touch the window's views; android_main runs on another. Our ANativeActivity_onCreate (on
+// the UI thread) registers a pipe with the UI thread's looper: writing a byte to it runs the request there.
+
+extern "C" void glue_ANativeActivity_onCreate(ANativeActivity* activity, void* saved, size_t size);
+
+namespace {
+
+ANativeActivity* g_activity = nullptr;
+int g_ui_pipe[2] = {-1, -1};
+
+void hide_system_bars(JNIEnv* env, jobject activity) {
+    jclass act = env->GetObjectClass(activity);
+    jobject window = env->CallObjectMethod(activity, env->GetMethodID(act, "getWindow", "()Landroid/view/Window;"));
+    if (env->ExceptionCheck() || !window) {
+        env->ExceptionClear();
+        return;
+    }
+    jclass winc = env->GetObjectClass(window);
+    bool hid = false;
+    // InsetsController.setSystemBarsBehavior() was added in API 30; some Android 10 (API 29) ROMs expose an internal
+    // getInsetsController() without that method, causing NoSuchMethodError / CheckJNI abort if called unconditionally.
+    if (android_get_device_api_level() >= 30) {
+        jmethodID get_ctl = env->GetMethodID(winc, "getInsetsController", "()Landroid/view/WindowInsetsController;");
+        if (env->ExceptionCheck()) env->ExceptionClear(), get_ctl = nullptr;
+        jobject ctl = get_ctl ? env->CallObjectMethod(window, get_ctl) : nullptr;
+        if (env->ExceptionCheck()) env->ExceptionClear(), ctl = nullptr;
+        if (ctl) {  // Android 11+
+            jclass cc = env->GetObjectClass(ctl);
+            jclass types = env->FindClass("android/view/WindowInsets$Type");
+            jmethodID sys_bars = types ? env->GetStaticMethodID(types, "systemBars", "()I") : nullptr;
+            jmethodID set_beh = cc ? env->GetMethodID(cc, "setSystemBarsBehavior", "(I)V") : nullptr;
+            jmethodID hide = cc ? env->GetMethodID(cc, "hide", "(I)V") : nullptr;
+            if (!env->ExceptionCheck() && types && sys_bars && set_beh && hide) {
+                jint bars = env->CallStaticIntMethod(types, sys_bars);
+                env->CallVoidMethod(ctl, set_beh, 2);  // show transient by swipe
+                env->CallVoidMethod(ctl, hide, bars);
+                if (!env->ExceptionCheck()) hid = true;
+            }
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+    }
+    if (!hid) {  // Android 10: immersive sticky | hide navigation | fullscreen | layout stable/hide navigation/fullscreen
+        jmethodID get_decor = env->GetMethodID(winc, "getDecorView", "()Landroid/view/View;");
+        jobject decor = get_decor && !env->ExceptionCheck() ? env->CallObjectMethod(window, get_decor) : nullptr;
+        if (decor && !env->ExceptionCheck()) {
+            jmethodID set_vis = env->GetMethodID(env->GetObjectClass(decor), "setSystemUiVisibility", "(I)V");
+            if (set_vis && !env->ExceptionCheck()) env->CallVoidMethod(decor, set_vis, 0x1706);
+        }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+}
+
+std::mutex g_toast_m;
+std::string g_toast_msg;
+
+void show_toast_ui(JNIEnv* env, jobject activity, const std::string& msg) {
+    if (!env || !activity || msg.empty()) return;
+    jclass toast_cls = env->FindClass("android/widget/Toast");
+    jmethodID make_text = toast_cls
+                              ? env->GetStaticMethodID(toast_cls, "makeText",
+                                                       "(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;")
+                              : nullptr;
+    jmethodID show_mid = toast_cls ? env->GetMethodID(toast_cls, "show", "()V") : nullptr;
+    jstring jmsg = (make_text && show_mid && !env->ExceptionCheck()) ? env->NewStringUTF(msg.c_str()) : nullptr;
+    jobject toast = (jmsg && !env->ExceptionCheck())
+                        ? env->CallStaticObjectMethod(toast_cls, make_text, activity, jmsg, jint(0))
+                        : nullptr;
+    if (toast && !env->ExceptionCheck()) env->CallVoidMethod(toast, show_mid);
+    if (toast) env->DeleteLocalRef(toast);
+    if (jmsg) env->DeleteLocalRef(jmsg);
+    if (toast_cls) env->DeleteLocalRef(toast_cls);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+}
+
+int on_ui_request(int fd, int, void*) {
+    bool do_immersive = false;
+    bool do_toast = false;
+    char buf[16];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof buf)) > 0) {
+        for (ssize_t i = 0; i < n; i++) {
+            if (buf[i] == 1) do_immersive = true;
+            else if (buf[i] == 2) do_toast = true;
+        }
+    }
+    if (g_activity && do_immersive) hide_system_bars(g_activity->env, g_activity->clazz);
+    if (g_activity && do_toast) {
+        std::string msg;
+        {
+            std::lock_guard lk(g_toast_m);
+            msg = g_toast_msg;
+        }
+        show_toast_ui(g_activity->env, g_activity->clazz, msg);
+    }
+    return 1;
+}
+
+void request_immersive() {
+    char c = 1;
+    if (g_ui_pipe[1] >= 0) (void)write(g_ui_pipe[1], &c, 1);
+}
+
+}  // namespace
+
+namespace nx::plat {
+void show_toast(const char* msg) {
+    if (!msg || !msg[0] || g_ui_pipe[1] < 0) return;
+    {
+        std::lock_guard lk(g_toast_m);
+        g_toast_msg = msg;
+    }
+    char c = 2;
+    (void)write(g_ui_pipe[1], &c, 1);
+}
+}  // namespace nx::plat
+
+// Frames presented so far, for the launcher's FPS counter (GameActivity.nativeFrames, in the game's own process).
+extern "C" JNIEXPORT jlong JNICALL Java_io_github_belmantegu_wonderrecomp_GameActivity_nativeFrames(JNIEnv*, jclass) {
+    return jlong(nx::g_frame.load());
+}
+
+extern "C" JNIEXPORT void ANativeActivity_onCreate(ANativeActivity* activity, void* saved, size_t size) {
+    g_activity = activity;
+    if (activity->internalDataPath) nx::plat::g_internal_dir = activity->internalDataPath;
+    if (g_ui_pipe[0] < 0 && pipe2(g_ui_pipe, O_NONBLOCK | O_CLOEXEC) == 0)
+        ALooper_addFd(ALooper_forThread(), g_ui_pipe[0], ALOOPER_POLL_CALLBACK, ALOOPER_EVENT_INPUT, on_ui_request, nullptr);
+    glue_ANativeActivity_onCreate(activity, saved, size);
+}
+
+// ---- vibration (plat::rumble) ---------------------------------------------------------------------------------
+// The game sends its motors' strength as often as it likes; it holds until the game sends another, as on a Switch. A
+// thread of our own turns it into Vibrator calls: a 200 ms one-shot at that strength, renewed every 100 ms while it
+// holds or as soon as it changes, cancelled when it drops to 0 or the app goes to the background. The thread sleeps
+// until the strength changes while the motor is off. The motor: the controller the player last pressed a button on
+// when it is an external one with motors of its own (Android 12+, InputDevice.getVibratorManager), else the device's
+// own (a handheld's, or the phone's). Android is told it is a game's vibration (media vibration), not touch feedback,
+// which players often turn off. Strength in percent: NX_VIBRATION=<0..100> in config.txt (default 100; 0: off). The
+// game's amplitudes (HD rumble, mostly 0.1..0.6) are taken as their square root, as a Switch controller's resonant
+// motor feels stronger than a phone's at the same value.
+
+namespace {
+
+std::mutex g_rumble_m;
+std::condition_variable g_rumble_cv;
+float g_rumble = 0.0f;         // the strength the game sent last (under g_rumble_m)
+bool g_rumble_changed = false;  // since the thread last looked (under g_rumble_m)
+std::atomic<int32_t> g_controller{-1};  // the input device of the last gamepad input
+
+int rumble_percent() {
+    static const int pct = [] {
+        const char* e = std::getenv("NX_VIBRATION");
+        return e ? std::clamp(std::atoi(e), 0, 100) : 100;
+    }();
+    return pct;
+}
+
+// The Java side of the motors. Classes and methods that the device's Android version lacks stay null.
+struct Vibration {
+    JNIEnv* env = nullptr;
+    int sdk = 0;
+    jobject system = nullptr;     // Vibrator, the device's own (global ref)
+    bool system_amplitude = false;
+    jobject attributes = nullptr;  // VibrationAttributes USAGE_MEDIA (Android 11+, global ref)
+    jobject audio_attributes = nullptr;  // AudioAttributes USAGE_GAME (before Android 13, global ref)
+    jclass effect_class = nullptr, combined_class = nullptr;
+    jmethodID one_shot = nullptr, parallel = nullptr;
+    jmethodID vibrate_attrs = nullptr, vibrate_audio = nullptr, cancel = nullptr;  // Vibrator
+    jmethodID manager_vibrate = nullptr, manager_cancel = nullptr;                 // VibratorManager
+    // The controller's motors: its VibratorManager (global ref), null when the device's own are used.
+    jobject controller = nullptr;
+    int32_t controller_id = -1;
+    bool controller_amplitude = false;
+
+    bool failed() {
+        if (!env->ExceptionCheck()) return false;
+        env->ExceptionClear();
+        return true;
+    }
+    jclass find(const char* name) {
+        jclass c = env->FindClass(name);
+        if (failed() || !c) return nullptr;
+        jclass g = static_cast<jclass>(env->NewGlobalRef(c));
+        env->DeleteLocalRef(c);
+        return g;
+    }
+    jmethodID method(jclass c, const char* name, const char* sig) {
+        jmethodID m = c ? env->GetMethodID(c, name, sig) : nullptr;
+        return failed() ? nullptr : m;
+    }
+    jobject global(jobject o) {
+        jobject g = o ? env->NewGlobalRef(o) : nullptr;
+        if (o) env->DeleteLocalRef(o);
+        return g;
+    }
+
+    bool init() {
+        sdk = android_get_device_api_level();
+        jobject act = g_activity->clazz;
+        jclass act_class = env->GetObjectClass(act);
+        jmethodID get_service = method(act_class, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+        env->DeleteLocalRef(act_class);
+        jstring name = env->NewStringUTF("vibrator");
+        jobject vib = get_service ? env->CallObjectMethod(act, get_service, name) : nullptr;
+        env->DeleteLocalRef(name);
+        if (failed()) vib = nullptr;
+        system = global(vib);
+        jclass vc = find("android/os/Vibrator");
+        effect_class = find("android/os/VibrationEffect");
+        one_shot = effect_class ? env->GetStaticMethodID(effect_class, "createOneShot", "(JI)Landroid/os/VibrationEffect;")
+                                : nullptr;
+        if (failed()) one_shot = nullptr;
+        cancel = method(vc, "cancel", "()V");
+        if (sdk >= 30) {  // VibrationAttributes.Builder().setUsage(USAGE_MEDIA).build()
+            jclass bc = find("android/os/VibrationAttributes$Builder");
+            jmethodID ctor = method(bc, "<init>", "()V");
+            jmethodID set_usage = method(bc, "setUsage", "(I)Landroid/os/VibrationAttributes$Builder;");
+            jmethodID build = method(bc, "build", "()Landroid/os/VibrationAttributes;");
+            if (ctor && set_usage && build) {
+                jobject b = env->NewObject(bc, ctor);
+                jobject b2 = b && !failed() ? env->CallObjectMethod(b, set_usage, jint(19)) : nullptr;  // USAGE_MEDIA
+                jobject a = b2 && !failed() ? env->CallObjectMethod(b2, build) : nullptr;
+                if (failed()) a = nullptr;
+                attributes = global(a);
+                if (b2) env->DeleteLocalRef(b2);
+                if (b) env->DeleteLocalRef(b);
+            }
+            if (bc) env->DeleteGlobalRef(bc);
+        }
+        if (sdk >= 33 && attributes)
+            vibrate_attrs = method(vc, "vibrate", "(Landroid/os/VibrationEffect;Landroid/os/VibrationAttributes;)V");
+        if (!vibrate_attrs) {  // AudioAttributes.Builder().setUsage(USAGE_GAME).build()
+            jclass bc = find("android/media/AudioAttributes$Builder");
+            jmethodID ctor = method(bc, "<init>", "()V");
+            jmethodID set_usage = method(bc, "setUsage", "(I)Landroid/media/AudioAttributes$Builder;");
+            jmethodID build = method(bc, "build", "()Landroid/media/AudioAttributes;");
+            if (ctor && set_usage && build) {
+                jobject b = env->NewObject(bc, ctor);
+                jobject b2 = b && !failed() ? env->CallObjectMethod(b, set_usage, jint(14)) : nullptr;  // USAGE_GAME
+                jobject a = b2 && !failed() ? env->CallObjectMethod(b2, build) : nullptr;
+                if (failed()) a = nullptr;
+                audio_attributes = global(a);
+                if (b2) env->DeleteLocalRef(b2);
+                if (b) env->DeleteLocalRef(b);
+            }
+            if (bc) env->DeleteGlobalRef(bc);
+            vibrate_audio = method(vc, "vibrate", "(Landroid/os/VibrationEffect;Landroid/media/AudioAttributes;)V");
+        }
+        if (system && vc) {
+            jmethodID has = method(vc, "hasVibrator", "()Z");
+            if (!has || !env->CallBooleanMethod(system, has) || failed()) {
+                env->DeleteGlobalRef(system);
+                system = nullptr;
+            }
+        }
+        if (system) system_amplitude = amplitude_control(system);
+        if (sdk >= 31 && attributes) {
+            combined_class = find("android/os/CombinedVibration");
+            parallel = combined_class ? env->GetStaticMethodID(combined_class, "createParallel",
+                                                               "(Landroid/os/VibrationEffect;)Landroid/os/CombinedVibration;")
+                                      : nullptr;
+            if (failed()) parallel = nullptr;
+            jclass mc = find("android/os/VibratorManager");
+            manager_vibrate = method(mc, "vibrate", "(Landroid/os/CombinedVibration;Landroid/os/VibrationAttributes;)V");
+            manager_cancel = method(mc, "cancel", "()V");
+            if (mc) env->DeleteGlobalRef(mc);
+        }
+        if (vc) env->DeleteGlobalRef(vc);
+        const bool can_system = system && cancel && (vibrate_attrs || (vibrate_audio && audio_attributes));
+        if (!can_system) {
+            if (system) env->DeleteGlobalRef(system);
+            system = nullptr;
+        }
+        nx::log("vibration: %s, strength %d%%%s",
+                system ? (system_amplitude ? "the device's vibrator (amplitude control)" : "the device's vibrator (on/off only)")
+                       : "no vibrator on this device",
+                rumble_percent(), manager_vibrate && parallel ? "; external controllers' own motors when they have some" : "");
+        return one_shot && (system || (manager_vibrate && parallel));
+    }
+
+    bool amplitude_control(jobject vibrator) {
+        jclass c = env->GetObjectClass(vibrator);
+        jmethodID m = method(c, "hasAmplitudeControl", "()Z");
+        env->DeleteLocalRef(c);
+        const bool on = m && env->CallBooleanMethod(vibrator, m);
+        return !failed() && on;
+    }
+
+    // The controller `id`'s VibratorManager, when it is an external controller with motors (Android 12+).
+    void pick_controller(int32_t id) {
+        if (id == controller_id) return;
+        stop();
+        if (controller) env->DeleteGlobalRef(controller), controller = nullptr;
+        controller_id = id;
+        if (id < 0 || !manager_vibrate || !manager_cancel || !parallel) return;
+        jclass ic = env->FindClass("android/view/InputDevice");
+        if (failed() || !ic) return;
+        jmethodID get_device = env->GetStaticMethodID(ic, "getDevice", "(I)Landroid/view/InputDevice;");
+        jmethodID is_external = failed() ? nullptr : env->GetMethodID(ic, "isExternal", "()Z");
+        jmethodID get_manager = failed() ? nullptr : env->GetMethodID(ic, "getVibratorManager", "()Landroid/os/VibratorManager;");
+        jmethodID get_name = failed() ? nullptr : env->GetMethodID(ic, "getName", "()Ljava/lang/String;");
+        if (failed() || !get_device || !is_external || !get_manager || !get_name) {
+            env->DeleteLocalRef(ic);
+            return;
+        }
+        jobject dev = env->CallStaticObjectMethod(ic, get_device, jint(id));
+        if (failed()) dev = nullptr;
+        jobject mgr = dev && env->CallBooleanMethod(dev, is_external) && !failed() ? env->CallObjectMethod(dev, get_manager)
+                                                                                 : nullptr;
+        if (failed()) mgr = nullptr;
+        if (mgr) {
+            jclass mc = env->GetObjectClass(mgr);
+            jmethodID ids = method(mc, "getVibratorIds", "()[I");
+            jmethodID def = method(mc, "getDefaultVibrator", "()Landroid/os/Vibrator;");
+            env->DeleteLocalRef(mc);
+            jintArray arr = ids ? static_cast<jintArray>(env->CallObjectMethod(mgr, ids)) : nullptr;
+            if (failed()) arr = nullptr;
+            const jsize motors = arr ? env->GetArrayLength(arr) : 0;
+            if (arr) env->DeleteLocalRef(arr);
+            if (motors > 0) {
+                jobject v = def ? env->CallObjectMethod(mgr, def) : nullptr;
+                if (failed()) v = nullptr;
+                controller_amplitude = v && amplitude_control(v);
+                if (v) env->DeleteLocalRef(v);
+                controller = global(mgr), mgr = nullptr;
+                jstring n = static_cast<jstring>(env->CallObjectMethod(dev, get_name));
+                const char* name = n && !failed() ? env->GetStringUTFChars(n, nullptr) : nullptr;
+                nx::log("vibration: controller \"%s\", %d motor%s, %s", name ? name : "?", int(motors), motors == 1 ? "" : "s",
+                        controller_amplitude ? "amplitude control" : "on/off only");
+                if (name) env->ReleaseStringUTFChars(n, name);
+                if (n) env->DeleteLocalRef(n);
+            }
+            if (mgr) env->DeleteLocalRef(mgr);
+        }
+        if (dev) env->DeleteLocalRef(dev);
+        env->DeleteLocalRef(ic);
+    }
+
+    bool amplitude() const { return controller ? controller_amplitude : system_amplitude; }
+
+    void vibrate(int amp) {  // amp 1..255, or -1 (VibrationEffect.DEFAULT_AMPLITUDE)
+        jobject effect = env->CallStaticObjectMethod(effect_class, one_shot, jlong(200), jint(amp));
+        if (failed() || !effect) return;
+        if (controller) {
+            jobject combined = env->CallStaticObjectMethod(combined_class, parallel, effect);
+            if (!failed() && combined) env->CallVoidMethod(controller, manager_vibrate, combined, attributes), failed();
+            if (combined) env->DeleteLocalRef(combined);
+        } else if (system) {
+            if (vibrate_attrs)
+                env->CallVoidMethod(system, vibrate_attrs, effect, attributes);
+            else
+                env->CallVoidMethod(system, vibrate_audio, effect, audio_attributes);
+            failed();
+        }
+        env->DeleteLocalRef(effect);
+    }
+
+    void stop() {
+        if (controller)
+            env->CallVoidMethod(controller, manager_cancel), failed();
+        else if (system)
+            env->CallVoidMethod(system, cancel), failed();
+    }
+};
+
+void rumble_thread(void*) {
+    nx::plat::set_thread_name("rumble");
+    Vibration v;
+    if (!g_activity || g_activity->vm->AttachCurrentThread(&v.env, nullptr) != JNI_OK) return;
+    if (!v.init()) {
+        g_activity->vm->DetachCurrentThread();
+        return;
+    }
+    int last = 0;
+    uint64_t renew = 0;
+    std::unique_lock lk(g_rumble_m);
+    for (;;) {
+        if (last == 0)
+            g_rumble_cv.wait(lk, [] { return g_rumble_changed; });
+        else
+            g_rumble_cv.wait_for(lk, std::chrono::milliseconds(100), [] { return g_rumble_changed; });
+        g_rumble_changed = false;
+        float s = g_rumble;
+        lk.unlock();
+        const uint64_t now = nx::plat::monotonic_ns();
+        if (nx::plat::window_minimized()) s = 0.0f;
+        const int32_t id = g_controller.load();
+        if (id != v.controller_id) v.pick_controller(id), last = 0;  // pick_controller stopped the old motors
+        int amp = 0;
+        if (s >= 0.02f)
+            amp = v.amplitude() ? std::clamp(int(std::lround(std::sqrt(s) * float(rumble_percent()) * 2.55f)), 1, 255)
+                                : -1;  // VibrationEffect.DEFAULT_AMPLITUDE
+        if (amp == 0) {
+            if (last) v.stop();
+            last = 0;
+        } else if ((amp != last && (std::abs(amp - last) >= 16 || last == 0)) || now >= renew) {
+            v.vibrate(amp);
+            last = amp, renew = now + 100'000'000ull;
+        }
+        lk.lock();
+    }
+}
+
+}  // namespace
+
+void nx::plat::note_controller(int32_t device_id) { g_controller.store(device_id, std::memory_order_relaxed); }
+
+void nx::plat::rumble(float strength) {
+    if (rumble_percent() == 0) return;
+    {
+        std::lock_guard lk(g_rumble_m);
+        if (strength == g_rumble) return;
+        g_rumble = strength;
+        g_rumble_changed = true;
+    }
+    g_rumble_cv.notify_one();
+    static std::once_flag started;
+    if (strength > 0.0f) std::call_once(started, [] { nx::plat::start_thread(rumble_thread, nullptr, 256u << 10); });
+}
+
+// All-files access (Android 11+): needed to read Internal storage/<game title>. Asks for it by opening the system page.
+static bool has_all_files_access(android_app* app) {
+    if (!app || !app->activity || !app->activity->vm) return true;
+    JNIEnv* env = nullptr;
+    if (app->activity->vm->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) return true;
+    jclass envc = env->FindClass("android/os/Environment");
+    if (!envc) { if (env->ExceptionCheck()) env->ExceptionClear(); return true; }
+    jmethodID m = env->GetStaticMethodID(envc, "isExternalStorageManager", "()Z");
+    bool ok = m && env->CallStaticBooleanMethod(envc, m);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    return ok;
+}
+
+static void request_all_files_access(android_app* app) {
+    if (!app || !app->activity || !app->activity->vm) return;
+    JNIEnv* env = nullptr;
+    if (app->activity->vm->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) return;
+    // The installed package (a test build may be renamed: android/build_apk.ps1 -TestPackage).
+    jclass actc = env->GetObjectClass(app->activity->clazz);
+    if (!actc) { if (env->ExceptionCheck()) env->ExceptionClear(); return; }
+    jmethodID get_pkg = env->GetMethodID(actc, "getPackageName", "()Ljava/lang/String;");
+    auto pkg = get_pkg ? static_cast<jstring>(env->CallObjectMethod(app->activity->clazz, get_pkg)) : nullptr;
+    const char* pkg_chars = pkg ? env->GetStringUTFChars(pkg, nullptr) : nullptr;
+    const std::string name = pkg_chars ? pkg_chars : nx::game::kInfo.android_package;
+    if (pkg_chars) env->ReleaseStringUTFChars(pkg, pkg_chars);
+    jclass uric = env->FindClass("android/net/Uri");
+    if (!uric) { if (env->ExceptionCheck()) env->ExceptionClear(); return; }
+    jobject uri = env->CallStaticObjectMethod(uric, env->GetStaticMethodID(uric, "parse", "(Ljava/lang/String;)Landroid/net/Uri;"),
+                                              env->NewStringUTF(("package:" + name).c_str()));
+    jclass intentc = env->FindClass("android/content/Intent");
+    if (!intentc) { if (env->ExceptionCheck()) env->ExceptionClear(); return; }
+    jobject intent = env->NewObject(intentc, env->GetMethodID(intentc, "<init>", "(Ljava/lang/String;Landroid/net/Uri;)V"),
+                                    env->NewStringUTF("android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION"), uri);
+    env->CallVoidMethod(app->activity->clazz, env->GetMethodID(actc, "startActivity", "(Landroid/content/Intent;)V"), intent);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+}
+
+#if NX_NCE
+static const char* const kDataProbe = "/exefs/main";  // native execution: the player's own exefs
+#else
+static const char* const kDataProbe = "/analysis/main.bin";
+#endif
+static bool has_data(const std::string& root) { return access((root + kDataProbe).c_str(), R_OK) == 0; }
+
+extern "C" void android_main(android_app* app) {
+    using namespace nx::plat;
+    g_app = app;
+    if (app && app->activity && app->activity->internalDataPath && g_internal_dir.empty()) {
+        g_internal_dir = app->activity->internalDataPath;
+    }
+    // Game data: Internal storage/<game title> (put there by the player, needs all-files access) or the app's own
+    // external files folder (adb push).
+    // The folder picked on the home screen (games/<game>/java Home.java writes <files>/data_root.txt) comes first.
+    std::string chosen;
+    if (app && app->activity && app->activity->internalDataPath) {
+        std::ifstream f(std::string(app->activity->internalDataPath) + "/data_root.txt");
+        std::getline(f, chosen);
+        while (!chosen.empty() && (chosen.back() == '\r' || chosen.back() == '\n' || chosen.back() == ' ')) chosen.pop_back();
+    }
+    const std::string shared = !chosen.empty() ? chosen : std::string("/storage/emulated/0/") + nx::game::kInfo.title;
+    const std::string own = (app && app->activity && app->activity->externalDataPath) ? app->activity->externalDataPath : shared;
+    const bool has_image = (std::getenv("NX_GAME_FD") && *std::getenv("NX_GAME_FD")) ||
+                           (std::getenv("NX_GAME_NSP") && *std::getenv("NX_GAME_NSP"));
+    if (!has_image && !has_data(own) && !has_all_files_access(app)) {
+        request_all_files_access(app);
+        while (!has_all_files_access(app)) {  // keep the app responsive until the switch is turned on
+            int events;
+            android_poll_source* src;
+            while (ALooper_pollOnce(100, nullptr, &events, reinterpret_cast<void**>(&src)) >= 0) {
+                if (src) src->process(app, src);
+                if (app->destroyRequested) _exit(0);
+            }
+        }
+    }
+    // The picked folder wins over the app's own one; else the own one (adb push), else Internal storage/<title>.
+    g_root = !chosen.empty() && has_data(chosen) ? chosen : has_data(own) ? own : shared;
+    // config.txt's NX_* lines become environment variables (the NVN layer reads its switches with getenv), without
+    // overriding a variable already set. Android defaults: handheld (720p, the lighter GPU load).
+    {
+        unsetenv("NX_STRETCH");
+        std::ifstream f(g_root + "/config.txt");
+        std::string line;
+        while (std::getline(f, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            auto eq = line.find('=');
+            if (line.rfind("NX_", 0) == 0 && eq != std::string::npos) {
+                const std::string key = line.substr(0, eq);
+                const std::string value = line.substr(eq + 1);
+                // Launcher and NativeActivity share a process: update NX_* keys from config.txt across launches.
+                setenv(key.c_str(), value.c_str(), 1);
+            }
+        }
+        // NX_HANDHELD=0 in config.txt (the launcher's TV mode): docked, 1080p. svc_am.cpp tests only whether the variable
+        // exists, so "0" must remove it.
+        if (const char* h = getenv("NX_HANDHELD"); h && h[0] == '0')
+            unsetenv("NX_HANDHELD");
+        else
+            setenv("NX_HANDHELD", "1", 0);
+    }
+    // The heap (scudo) zero-fills every allocation and gives freed pages back at once by default: in the replay, a
+    // memset under each allocation and madvise churn (docs/nvn/android-perf/PLAN.md, phase 2). NX_MALLOC_TUNE=0: as
+    // the system set it.
+    if (const char* e = getenv("NX_MALLOC_TUNE"); !(e && e[0] == '0')) {
+        int zero = mallopt(M_BIONIC_ZERO_INIT, 1), decay = mallopt(M_DECAY_TIME, 1);
+#ifndef M_CACHE_COUNT_MAX
+#define M_CACHE_COUNT_MAX (-200)
+#endif
+#ifndef M_CACHE_SIZE_MAX
+#define M_CACHE_SIZE_MAX (-201)
+#endif
+        int cache_cnt = mallopt(M_CACHE_COUNT_MAX, 256);
+        int cache_sz = mallopt(M_CACHE_SIZE_MAX, 16 << 20);
+        nx::log("heap: zero-fill off (%d), page release delayed (%d), scudo cache (%d, %d)",
+                zero, decay, cache_cnt, cache_sz);
+    }
+    start_memory_guard();
+    gpu_turbo();
+    app->onAppCmd = on_cmd;
+    app->onInputEvent = on_input;
+    // NX_SHOW_WHEN_LOCKED=1 (unattended test runs, tools/wonder_phone_course.sh): shown over the lock screen and turning
+    // the screen on, as an alarm app; the phone itself stays locked.
+    uint32_t flags = AWINDOW_FLAG_KEEP_SCREEN_ON | AWINDOW_FLAG_FULLSCREEN;
+    if (const char* e = getenv("NX_SHOW_WHEN_LOCKED"); e && e[0] == '1')
+        flags |= AWINDOW_FLAG_SHOW_WHEN_LOCKED | AWINDOW_FLAG_TURN_SCREEN_ON;
+    if (app && app->activity)
+        ANativeActivity_setWindowFlags(app->activity, flags, 0);
+
+    struct sigaction sa{};
+    sa.sa_sigaction = crash;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP}) sigaction(s, &sa, &g_previous[s]);
+
+    nx::log("%s (Switch recomp) on Android, data at %s (own folder %s: %s)", nx::game::kInfo.title, g_root.c_str(),
+            own.c_str(), has_data(own) ? "has the data" : kDataProbe);
+    static bool started = false;
+    for (;;) {
+        int events;
+        android_poll_source* src;
+        while (ALooper_pollOnce(started ? 16 : 50, nullptr, &events, reinterpret_cast<void**>(&src)) >= 0) {
+            if (src) src->process(app, src);
+            if (app->destroyRequested) _exit(0);
+        }
+        if (!started && g_window) {
+            started = true;
+            start_thread(game_thread, nullptr, 256ull << 20);  // the guest main thread; deep host recursion
+            nx::plat::pin_current_thread_to_little_cores("android_main");
+        }
+    }
+}

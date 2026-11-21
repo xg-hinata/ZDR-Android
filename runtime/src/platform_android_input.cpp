@@ -1,0 +1,467 @@
+#include <cstdlib>
+// Android host (NativeActivity): memory (mmap at fixed addresses), pthreads, the app's window (ANativeWindow),
+// game controllers + touch, AAudio, the Vulkan loader and android surface, a signal crash handler and
+// android_main. Game data lives in the app's external files dir (see docs/ANDROID.md):
+//   <files>/analysis/{main,sdk}.bin   module images (tools/nso2bin.py)
+//   <files>/extract/romfs/...         the RomFS
+//   <files>/user/...                  saves
+//   <files>/config.txt                optional: resolution=WxH
+#include <aaudio/AAudio.h>
+#include <android/log.h>
+#include <android/native_window.h>
+#include <android/window.h>
+#include <android_native_app_glue.h>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <jni.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <cmath>
+#include <cstring>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#define VK_NO_PROTOTYPES
+#define VK_USE_PLATFORM_ANDROID_KHR
+#include <vulkan/vulkan.h>
+
+#include <nx/game.h>
+#include <nx/runtime.h>
+
+#include "kernel.h"
+#include "platform.h"
+#include "platform_android.h"
+#include "touch_layout.h"
+
+// Android input: game controllers and touch (split from platform_android.cpp).
+namespace nx::plat {
+
+// ---- input: game controllers + touch --------------------------------------------------------------------------
+// Touch: left half = virtual stick (relative to where the finger went down); right half = four buttons in a
+// diamond around the thumb (Y attack up-left, X special up-right, B dash down-left, A interact down-right), top
+// corners L / R, top centre +. Games with a drawn layout (touch_layout.cpp) use its buttons instead, and may make the
+// rest of the right half a second stick (P5R: the camera).
+
+namespace {
+std::mutex g_in;
+PadState g_pad_buttons;      // controller stick state
+uint64_t g_key_buttons = 0;  // digital controller/keyboard button state (KeyEvent)
+uint64_t g_axis_buttons = 0; // analog hat/trigger button state (MotionEvent)
+enum Stick : uint8_t { kNoStick, kLeftStick, kRightStick };
+struct Touch {
+    int32_t id;
+    float x0, y0, x, y;
+    Stick stick;
+    uint64_t button;
+    uint64_t down_ns;
+};
+std::vector<Touch> g_touches;
+// A quick tap still reaches the game: a button let go sooner than kMinHoldNs after it went down stays held until
+// then (some P5R menus missed taps of 100-200 ms that the game had read on several frames).
+struct Latch {
+    uint64_t button, until_ns;
+};
+std::vector<Latch> g_latched;
+constexpr uint64_t kMinHoldNs = 25'000'000;  // 25 ms (~1.5 frames at 60 fps) so rapid taps never coalesce into a hold
+
+void release_touch(const Touch& t, uint64_t now) {
+    if (t.button && now < t.down_ns + kMinHoldNs) g_latched.push_back({t.button, t.down_ns + kMinHoldNs});
+}
+float g_w = 1, g_h = 1;
+bool g_gamepad = false;  // the last input came from a controller: the drawn touch controls hide
+uint64_t g_last_touch_ns = 0;  // the drawn controls dim after kTouchIdleNs without a touch
+constexpr uint64_t kTouchIdleNs = 8'000'000'000;
+
+constexpr float kDebugTraceBtnX = 0.500f;
+constexpr float kDebugTraceBtnY = 0.070f;
+constexpr float kDebugTraceBtnR = 0.036f;
+std::atomic<uint64_t> g_debug_trace_flash_until_ns{0};
+
+bool debug_trace_button_enabled() {
+    static const bool on = [] {
+        const char* en = std::getenv("NX_DEBUG_TRACE_BTN");
+        return en && en[0] == '1';
+    }();
+    return on;
+}
+
+bool hit_debug_trace_button(float nx, float ny, float aspect) {
+    const float dx = (nx - kDebugTraceBtnX) * aspect;
+    const float dy = ny - kDebugTraceBtnY;
+    const float r = kDebugTraceBtnR * 1.15f;
+    return dx * dx + dy * dy <= r * r;
+}
+
+void trigger_debug_trace() {
+    static uint64_t s_last_trace_ns = 0;
+    const uint64_t now = monotonic_ns();
+    if (now < s_last_trace_ns + 2'000'000'000ull) return;
+    s_last_trace_ns = now;
+    g_debug_trace_flash_until_ns.store(now + 400'000'000ull, std::memory_order_relaxed);
+    const std::string root = data_root();
+    if (!root.empty()) {
+        if (FILE* f = fopen_utf8(root + "/trace_draws", "wb")) {
+            std::fputs("1\n", f);
+            std::fclose(f);
+        }
+        if (FILE* f = fopen_utf8(root + "/dump_frames", "wb")) {
+            std::fputs("1 1\n", f);
+            std::fclose(f);
+        }
+        nx::log("debug trace button: armed trace_draws + dump_frames");
+        show_toast("Debug trace captured");
+    }
+}
+
+bool gamepad_swap_abxy() {
+    static const bool swap = [] {
+        const char* e = std::getenv("NX_GAMEPAD_LAYOUT");
+        return e && std::strcmp(e, "1") == 0;
+    }();
+    return swap;
+}
+
+float stick_sens() {
+    static const float s = [] {
+        const char* e = std::getenv("NX_STICK_SENSITIVITY");
+        int v = e ? std::atoi(e) : 100;
+        if (v < 25) v = 25;
+        if (v > 300) v = 300;
+        return float(v) / 100.0f;
+    }();
+    return s;
+}
+
+float camera_sens() {
+    static const float s = [] {
+        const char* e = std::getenv("NX_CAMERA_SENSITIVITY");
+        int v = e ? std::atoi(e) : 100;
+        if (v < 25) v = 25;
+        if (v > 300) v = 300;
+        return float(v) / 100.0f;
+    }();
+    return s;
+}
+
+uint64_t key_to_button(int32_t k) {
+    if (gamepad_swap_abxy()) {
+        switch (k) {
+            case AKEYCODE_BUTTON_A:
+            case AKEYCODE_BUTTON_3: return kA;  // bottom face button (Cross / A)
+            case AKEYCODE_BUTTON_B:
+            case AKEYCODE_BUTTON_2: return kB;  // right face button (Circle / B)
+            case AKEYCODE_BUTTON_X:
+            case AKEYCODE_BUTTON_4: return kX;  // left face button (Square / X)
+            case AKEYCODE_BUTTON_Y:
+            case AKEYCODE_BUTTON_1: return kY;  // top face button (Triangle / Y)
+            default: break;
+        }
+    } else {
+        switch (k) {
+            case AKEYCODE_BUTTON_A:
+            case AKEYCODE_BUTTON_3: return kB;  // bottom face button = Nintendo B
+            case AKEYCODE_BUTTON_B:
+            case AKEYCODE_BUTTON_2: return kA;  // right face button = Nintendo A
+            case AKEYCODE_BUTTON_X:
+            case AKEYCODE_BUTTON_4: return kY;  // left face button = Nintendo Y
+            case AKEYCODE_BUTTON_Y:
+            case AKEYCODE_BUTTON_1: return kX;  // top face button = Nintendo X
+            default: break;
+        }
+    }
+    switch (k) {
+        case AKEYCODE_BUTTON_L1:
+        case AKEYCODE_BUTTON_7: return kL;
+        case AKEYCODE_BUTTON_R1:
+        case AKEYCODE_BUTTON_8: return kR;
+        case AKEYCODE_BUTTON_L2:
+        case AKEYCODE_BUTTON_5:
+        case AKEYCODE_BUTTON_C: return kZL;
+        case AKEYCODE_BUTTON_R2:
+        case AKEYCODE_BUTTON_6:
+        case AKEYCODE_BUTTON_Z: return kZR;
+        case AKEYCODE_BUTTON_START:
+        case AKEYCODE_BUTTON_10:
+        case AKEYCODE_BUTTON_MODE: return kPlus;
+        case AKEYCODE_BUTTON_SELECT:
+        case AKEYCODE_BUTTON_9: return kMinus;
+        case AKEYCODE_BUTTON_THUMBL:
+        case AKEYCODE_BUTTON_11: return kStickL;
+        case AKEYCODE_BUTTON_THUMBR:
+        case AKEYCODE_BUTTON_12: return kStickR;
+        case AKEYCODE_DPAD_LEFT: return kLeft;
+        case AKEYCODE_DPAD_UP: return kUp;
+        case AKEYCODE_DPAD_RIGHT: return kRight;
+        case AKEYCODE_DPAD_DOWN: return kDown;
+        case AKEYCODE_BACK: return kMinus;
+        // A keyboard: Enter / Space confirm (A), Escape goes back (B). (Some tablets keep BUTTON_B for their stylus.)
+        case AKEYCODE_ENTER: case AKEYCODE_NUMPAD_ENTER: case AKEYCODE_SPACE: case AKEYCODE_DPAD_CENTER: return kA;
+        case AKEYCODE_ESCAPE: return kB;
+        default: return 0;
+    }
+}
+
+uint64_t touch_button(float x, float y) {
+    float nx_ = x / g_w, ny = y / g_h;
+    if (ny < 0.2f) return nx_ < 0.6f ? (nx_ < 0.45f ? kL : kPlus) : (nx_ > 0.85f ? kR : kZR);
+    bool up = ny < 0.6f, right = nx_ > 0.8f;
+    if (up) return right ? kX : kY;
+    return right ? kA : kB;
+}
+
+}  // namespace
+
+int32_t on_input(android_app*, AInputEvent* e) {
+    std::lock_guard lk(g_in);
+    int32_t type = AInputEvent_getType(e);
+    int32_t src = AInputEvent_getSource(e);
+    if (type == AINPUT_EVENT_TYPE_KEY) {
+        uint64_t b = key_to_button(AKeyEvent_getKeyCode(e));
+        if (!b) return 0;
+        g_gamepad = true;
+        note_controller(AInputEvent_getDeviceId(e));
+        if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_DOWN)
+            g_key_buttons |= b;
+        else if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_UP)
+            g_key_buttons &= ~b;
+        return 1;
+    }
+    if (type != AINPUT_EVENT_TYPE_MOTION) return 0;
+    if ((src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK) {
+        g_gamepad = true;
+        note_controller(AInputEvent_getDeviceId(e));
+        // Radial 2D deadzone so circular physical sticks still reach 100% magnitude on diagonals.
+        auto stick_axes = [&](int32_t ax, int32_t ay, int32_t& out_x, int32_t& out_y) {
+            float x = AMotionEvent_getAxisValue(e, ax, 0);
+            float y = -AMotionEvent_getAxisValue(e, ay, 0);
+            constexpr float kDeadzone = 0.12f;
+            constexpr float kOuter = 0.95f;
+            float mag = std::hypot(x, y);
+            if (mag <= kDeadzone) {
+                out_x = 0;
+                out_y = 0;
+                return;
+            }
+            float scaled = std::min(1.0f, (mag - kDeadzone) / (kOuter - kDeadzone));
+            float inv = scaled / mag;
+            out_x = int32_t(std::clamp(x * inv, -1.f, 1.f) * kStickMax);
+            out_y = int32_t(std::clamp(y * inv, -1.f, 1.f) * kStickMax);
+        };
+        stick_axes(AMOTION_EVENT_AXIS_X, AMOTION_EVENT_AXIS_Y, g_pad_buttons.lx, g_pad_buttons.ly);
+        int32_t rx = 0, ry = 0;
+        stick_axes(AMOTION_EVENT_AXIS_Z, AMOTION_EVENT_AXIS_RZ, rx, ry);
+        if (!rx && !ry) stick_axes(AMOTION_EVENT_AXIS_RX, AMOTION_EVENT_AXIS_RY, rx, ry);
+        g_pad_buttons.rx = rx;
+        g_pad_buttons.ry = ry;
+        float hx = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_HAT_X, 0);
+        float hy = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_HAT_Y, 0);
+        uint64_t axis_buttons = 0;
+        if (hx < -0.5f) axis_buttons |= kLeft;
+        if (hx > 0.5f) axis_buttons |= kRight;
+        if (hy < -0.5f) axis_buttons |= kUp;
+        if (hy > 0.5f) axis_buttons |= kDown;
+        // Hysteresis prevents analog trigger chatter near the threshold, and keeping axis buttons separate from
+        // g_key_buttons prevents stick MotionEvents from clearing digital KeyEvent L2/R2/D-pad presses (Third Eye flicker).
+        constexpr float kTrigPress = 0.35f;
+        constexpr float kTrigRelease = 0.20f;
+        const float l_trig = std::max(AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_LTRIGGER, 0),
+                                      AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_BRAKE, 0));
+        const float r_trig = std::max(AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_RTRIGGER, 0),
+                                      AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_GAS, 0));
+        if (l_trig > ((g_axis_buttons & kZL) ? kTrigRelease : kTrigPress)) axis_buttons |= kZL;
+        if (r_trig > ((g_axis_buttons & kZR) ? kTrigRelease : kTrigPress)) axis_buttons |= kZR;
+        g_axis_buttons = axis_buttons;
+        return 1;
+    }
+    if ((src & AINPUT_SOURCE_TOUCHSCREEN) != AINPUT_SOURCE_TOUCHSCREEN) return 0;
+    int32_t action = AMotionEvent_getAction(e);
+    int32_t kind = action & AMOTION_EVENT_ACTION_MASK;
+    size_t index = size_t((action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
+    if (debug_trace_button_enabled() &&
+        (kind == AMOTION_EVENT_ACTION_DOWN || kind == AMOTION_EVENT_ACTION_POINTER_DOWN)) {
+        if (ANativeWindow* w = android_window()) {
+            g_w = float(ANativeWindow_getWidth(w));
+            g_h = float(ANativeWindow_getHeight(w));
+        }
+        if (g_w > 0.f && g_h > 0.f) {
+            const float x = AMotionEvent_getX(e, index), y = AMotionEvent_getY(e, index);
+            if (hit_debug_trace_button(x / g_w, y / g_h, g_w / g_h)) {
+                trigger_debug_trace();
+                return 1;
+            }
+        }
+    }
+    if (!touch_enabled()) return 0;  // NX_TOUCH_SHOW=0
+    const uint64_t now = monotonic_ns();
+    g_last_touch_ns = now;
+    if (ANativeWindow* w = android_window()) {
+        g_w = float(ANativeWindow_getWidth(w));
+        g_h = float(ANativeWindow_getHeight(w));
+    }
+    if (kind == AMOTION_EVENT_ACTION_DOWN || kind == AMOTION_EVENT_ACTION_POINTER_DOWN) {
+        if (kind == AMOTION_EVENT_ACTION_DOWN) g_touches.clear();  // primary touch start guarantees no prior fingers remain
+        float x = AMotionEvent_getX(e, index), y = AMotionEvent_getY(e, index);
+        int32_t id = AMotionEvent_getPointerId(e, index);
+        g_touches.erase(std::remove_if(g_touches.begin(), g_touches.end(), [&](const Touch& t) { return t.id == id; }),
+                        g_touches.end());
+        g_gamepad = false;
+        size_t drawn = 0;
+        touch_buttons(drawn);
+        if (drawn) {  // a drawn layout (touch_layout.cpp): its buttons first, the rest of the left half is the stick
+            uint64_t b = touch_hit(x / g_w, y / g_h, g_w / g_h);
+            bool left = !b && touch_stick_side(x / g_w);
+            Stick stick = b ? kNoStick : left ? kLeftStick : touch_right_stick() ? kRightStick : kNoStick;
+            if (b || stick) g_touches.push_back({id, x, y, x, y, stick, b, now});
+        } else {
+            bool left = x < g_w * 0.5f;
+            g_touches.push_back({id, x, y, x, y, left ? kLeftStick : kNoStick,
+                                 left ? 0 : touch_button(x, y), now});
+        }
+    } else if (kind == AMOTION_EVENT_ACTION_UP || kind == AMOTION_EVENT_ACTION_POINTER_UP ||
+               kind == AMOTION_EVENT_ACTION_CANCEL) {
+        int32_t id = AMotionEvent_getPointerId(e, index);
+        const bool all = kind == AMOTION_EVENT_ACTION_UP || kind == AMOTION_EVENT_ACTION_CANCEL;
+        g_touches.erase(std::remove_if(g_touches.begin(), g_touches.end(),
+                                       [&](const Touch& t) {
+                                           if (!all && t.id != id) return false;
+                                           release_touch(t, now);
+                                           return true;
+                                       }),
+                        g_touches.end());
+    } else if (kind == AMOTION_EVENT_ACTION_MOVE) {
+        size_t drawn = 0;
+        touch_buttons(drawn);
+        size_t count = AMotionEvent_getPointerCount(e);
+        // Prune any touch whose pointer id is no longer reported by Android (prevents stuck ZR/buttons).
+        g_touches.erase(std::remove_if(g_touches.begin(), g_touches.end(),
+                                       [&](const Touch& t) {
+                                           for (size_t k = 0; k < count; k++)
+                                               if (AMotionEvent_getPointerId(e, k) == t.id) return false;
+                                           return true;
+                                       }),
+                        g_touches.end());
+        for (size_t k = 0; k < count; k++) {
+            int32_t id = AMotionEvent_getPointerId(e, k);
+            for (auto& t : g_touches)
+                if (t.id == id) {
+                    t.x = AMotionEvent_getX(e, k);
+                    t.y = AMotionEvent_getY(e, k);
+                    if (t.stick == kNoStick) {
+                        t.button = drawn ? touch_hit(t.x / g_w, t.y / g_h, g_w / g_h) : touch_button(t.x, t.y);
+                    }
+                }
+        }
+    }
+    return 1;
+}
+
+bool headless() {  // NX_HEADLESS (platform.h)
+    static const bool on = std::getenv("NX_HEADLESS") != nullptr;
+    return on;
+}
+
+void read_pad(PadState& p) {
+    std::lock_guard lk(g_in);
+    p.buttons |= g_key_buttons | g_axis_buttons;
+    if (g_pad_buttons.lx || g_pad_buttons.ly) {
+        p.lx = g_pad_buttons.lx;
+        p.ly = g_pad_buttons.ly;
+    }
+    p.rx = g_pad_buttons.rx;
+    p.ry = g_pad_buttons.ry;
+    float radius = std::max(1.f, g_h * 0.12f);
+    size_t drawn = 0;
+    touch_buttons(drawn);
+    const uint64_t now = monotonic_ns();
+    g_latched.erase(std::remove_if(g_latched.begin(), g_latched.end(), [&](const Latch& l) { return now >= l.until_ns; }),
+                    g_latched.end());
+    for (const auto& l : g_latched) p.buttons |= l.button;
+    for (const auto& t : g_touches) {
+        float dx = (t.x - t.x0) / radius, dy = (t.y - t.y0) / radius;
+        if (t.stick == kLeftStick) {
+            float sx = dx * stick_sens();
+            float sy = -dy * stick_sens();
+            p.lx = int32_t(std::clamp(sx, -1.f, 1.f) * kStickMax);
+            p.ly = int32_t(std::clamp(sy, -1.f, 1.f) * kStickMax);
+            // A drawn layout's stick pushed nearly all the way may hold a button too (Wonder: Y, dash), so running
+            // needs no second thumb on the right side.
+            if (drawn && std::abs(dx) > 0.85f) p.buttons |= touch_stick_full_button();
+        } else if (t.stick == kRightStick) {
+            float sx = dx * camera_sens();
+            float sy = -dy * camera_sens();
+            p.rx = int32_t(std::clamp(sx, -1.f, 1.f) * kStickMax);
+            p.ry = int32_t(std::clamp(sy, -1.f, 1.f) * kStickMax);
+        } else {
+            p.buttons |= t.button;
+        }
+    }
+    input_script(p);  // NX_INPUT_SCRIPT (config.txt): scripted runs on the phone, as on the Mac
+}
+
+// The drawn layout's buttons (brighter while pressed) and the stick under the thumb; nothing while a controller is
+// in use or for games without a drawn layout.
+size_t touch_overlay(OverlayShape* out, size_t max) {
+    size_t n = 0, k = 0;
+    const TouchButton* b = touch_buttons(n);
+    auto append_debug_btn = [&] {
+        if (!debug_trace_button_enabled() || k >= max) return;
+        const bool flashed = monotonic_ns() < g_debug_trace_flash_until_ns.load(std::memory_order_relaxed);
+        out[k++] = {kDebugTraceBtnX, kDebugTraceBtnY, kDebugTraceBtnR, flashed ? 0.85f : 0.30f,
+                    touch_label(kGlyphL, kGlyphDigit0)};
+    };
+    if (!n) {
+        append_debug_btn();
+        return k;
+    }
+    std::lock_guard lk(g_in);
+    if (g_gamepad || !touch_enabled() || touch_hidden()) {
+        append_debug_btn();
+        return k;
+    }
+    // Dimmed to a third while nobody touches the screen (cutscenes, videos), back at once on the next touch.
+    const bool idle = g_touches.empty() && monotonic_ns() - g_last_touch_ns > kTouchIdleNs;
+    const float shade = touch_opacity_scale() * (idle ? 0.35f : 1.0f);
+    const Touch* stick = nullptr;
+    const Touch* camera = nullptr;
+    uint64_t held = 0;
+    for (const auto& t : g_touches) {
+        if (t.stick == kLeftStick) stick = &t;
+        if (t.stick == kRightStick) camera = &t;
+        held |= t.button;
+    }
+    for (const auto& l : g_latched) held |= l.button;
+    for (size_t i = 0; i < n && k < max; i++)
+        out[k++] = {b[i].x, b[i].y, b[i].r, std::min(1.0f, (held & b[i].button ? 0.5f : 0.2f) * shade), b[i].label};
+    // A stick under the thumb: its ring where the finger went down and the knob where it is now.
+    auto draw_stick = [&](const Touch& t) {
+        if (k + 2 > max) return;
+        float r = 0.12f, dx = (t.x - t.x0) / g_h, dy = (t.y - t.y0) / g_h;
+        float len = std::hypot(dx, dy), s = len > r ? r / len : 1.f;
+        out[k++] = {t.x0 / g_w, t.y0 / g_h, r, std::min(1.0f, 0.14f * shade)};
+        out[k++] = {(t.x0 / g_h + dx * s) * g_h / g_w, t.y0 / g_h + dy * s, 0.055f, std::min(1.0f, 0.45f * shade)};
+    };
+    if (stick) {
+        draw_stick(*stick);
+    } else if (k < max) {  // where the stick goes
+        float sx, sy, sr;
+        touch_stick_rest(sx, sy, sr);
+        out[k++] = {sx, sy, sr, std::min(1.0f, 0.08f * shade)};
+    }
+    if (camera) draw_stick(*camera);
+    append_debug_btn();
+    return k;
+}
+
+}  // namespace nx::plat
