@@ -404,7 +404,7 @@ public class Launcher extends Activity {
         } catch (Exception ignored) {}
         if (verName != null && !verName.isEmpty()) {
             TextView sub = new TextView(this);
-            sub.setText("ZDR-Android v" + verName);
+            sub.setText("ZDR-Android v" + verName + "  -  Port by XG-hinata");
             sub.setTextColor(Color.rgb(120, 160, 180));
             sub.setTextSize(12);
             sub.setPadding(0, dp(2), 0, dp(2));
@@ -1019,7 +1019,19 @@ public class Launcher extends Activity {
             sb.append("=== ZDR-Android v").append(appVer).append(" Log Export ===\n");
             sb.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\n");
             sb.append("Android: ").append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
-            sb.append("Date: ").append(new java.util.Date().toString()).append("\n\n");
+            sb.append("Date: ").append(new java.util.Date().toString()).append("\n");
+            String drv = activeDriver();
+            sb.append("GPU driver: ").append(drv.isEmpty() ? "system" : drv).append("\n");
+
+            File cfgFile = new File(dataDir(), "config.txt");
+            if (cfgFile.exists() && cfgFile.canRead()) {
+                sb.append("\n=== config.txt ===\n");
+                try (BufferedReader br = new BufferedReader(new FileReader(cfgFile))) {
+                    String line;
+                    while ((line = br.readLine()) != null) sb.append(line).append("\n");
+                }
+            }
+            sb.append("\n");
 
             try {
                 Process p = Runtime.getRuntime().exec(new String[] {"logcat", "-d", "-t", "500"});

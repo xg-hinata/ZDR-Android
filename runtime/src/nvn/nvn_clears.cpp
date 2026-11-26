@@ -487,7 +487,7 @@ void draw_clear(VkCommandBuffer cb, const Targets& t, const Cmd& c) {
             return;
         }
     }
-    if (!pass_open_on(t)) {
+    if (!pass_open_on(t) || (!color && !pass_ds_writable(a.aspectMask))) {
         draw_end_rendering(cb, 3);
         pass_begin(cb, t);
     }
@@ -499,12 +499,18 @@ void draw_clear(VkCommandBuffer cb, const Targets& t, const Cmd& c) {
         g_scissor_lost += scissored, g_mask_fallback += masked;
         draw_end_rendering(cb, 4);
         transition(cb, *img, VK_IMAGE_LAYOUT_GENERAL);
+        img->rendered = true;
         VkImageSubresourceRange r{a.aspectMask, std::min<uint32_t>(level, img->levels - 1), 1,
                                   std::min<uint32_t>(color ? t.views.layer[c.n] : t.views.layer[8], img->layers - 1), 1};
         if (color)
             p_vkCmdClearColorImage(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &a.clearValue.color, 1, &r);
         else
             p_vkCmdClearDepthStencilImage(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &a.clearValue.depthStencil, 1, &r);
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
+                               nullptr, 0, nullptr);
         return;
     }
     if (masked && mask_clear(cb, t, c.n, c.mask & 0xF, c.f, rect)) {

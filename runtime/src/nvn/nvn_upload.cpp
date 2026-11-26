@@ -168,6 +168,18 @@ void clear_image(VkCommandBuffer cb, GpuImage& img, bool magenta) {
         VkClearDepthStencilValue v{1.0f, 0};  // far: the course passes test LESS
         p_vkCmdClearDepthStencilImage(cb, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
     }
+    // Order the clear before any subsequent transfer write (e.g. CopyBufferToTexture -> vkCmdCopyBufferToImage)
+    // in the same TRANSFER_DST_OPTIMAL layout: without a TRANSFER_WRITE -> TRANSFER_WRITE barrier, Mali GPUs
+    // can execute the clear after the copy and wipe uploaded textures back to black.
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = img.image;
+    b.subresourceRange = r;
+    p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                           nullptr, 1, &b);
 }
 
 // Uploads of large pitch-linear textures: the CPU-written pictures of a film (nvn_queue.cpp counts them per present).

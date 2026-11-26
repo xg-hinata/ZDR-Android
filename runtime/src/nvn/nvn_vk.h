@@ -126,6 +126,8 @@ const DynamicStateCaps& vk_dynamic_caps();
 bool is_xclipse();
 bool is_mali();
 bool is_adreno();
+bool is_turnip();
+bool is_adreno_6xx_or_older();
 bool is_adreno_8xx();
 bool is_powervr();
 bool gpu_require_subgroup32();  // compute pipelines pin the subgroup size to 32 (nvn_pipeline.cpp)
@@ -363,13 +365,14 @@ VkExtent2D pass_render_area();
 void pass_begin(VkCommandBuffer cb, const Targets& t);
 void pass_set_ds_store_hint(bool reads_depth, bool writes_depth, bool uses_stencil);
 void pass_clear_ds_store_hint();
+bool pass_ds_writable(VkImageAspectFlags aspect);
 void pass_mark_written(uint32_t bits);
 // nvn_mask_clear.cpp: colour target `slot` of the open pass on `t` cleared to `rgba` in `rect`, only the channels in
 // `mask` (bit 0 r .. 3 a) written, by a fullscreen draw. False (nothing recorded) for integer targets or no pipeline.
 bool mask_clear(VkCommandBuffer cb, const Targets& t, uint32_t slot, uint32_t mask, const float rgba[4],
                 const VkRect2D& rect);
 // nvn_replay.cpp: a command list into `cb` (`depth`: CallList nesting).
-void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth);
+void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth, bool more_lists = false);
 std::shared_ptr<CmdList> submit_command_list(uint64_t handle);  // command_list(), once per handle per submit
 void submit_lists_reset();  // at each submit's start (draw_begin_submit)
 

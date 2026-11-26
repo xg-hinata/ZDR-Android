@@ -99,11 +99,22 @@ bool native_r11g11b10() {
 #if defined(__ANDROID__)
     if (!vk_physical()) return false;  // asked before the device exists: not decided yet
     const char* force_native = std::getenv("NX_R11G11B10_NATIVE");
+    const char* emu = std::getenv("NX_R11G11B10_EMULATE");
+    const bool force_emulate = emu && emu[0] != '0';
+    const bool force_no_emulate = emu && emu[0] == '0';
     const bool allow_mali = force_native && force_native[0] == '1';
-    // Mali and Xclipse GPUs may produce NaNs and green/purple flickering with B10G11R11_UFLOAT; keep RGBA16F unless
-    // opted in with NX_R11G11B10_NATIVE=1.
+    // Adreno 6xx stock drivers, Turnip, and PowerVR BXM can produce HDR NaN blackouts / tile flickering with
+    // B10G11R11_UFLOAT; keep RGBA16F by default (still overridable with NX_R11G11B10_EMULATE=0).
+    if ((is_adreno_6xx_or_older() || is_turnip() || is_powervr()) && !force_no_emulate) {
+        log("nvn/vk: %s detected: R11G11B10F kept as RGBA16F to prevent HDR NaN blackouts and tile flickering",
+            is_turnip() ? "Turnip" : is_powervr() ? "PowerVR" : "Adreno 6xx");
+        state.store(0, std::memory_order_release);
+        return false;
+    }
+    // Mali and Xclipse GPUs may produce NaNs and black/green/purple flickering with B10G11R11_UFLOAT;
+    // keep RGBA16F unless opted in with NX_R11G11B10_NATIVE=1 (paired with SPIR-V NClamp output clamping).
     if ((is_mali() || is_xclipse()) && !allow_mali) {
-        log("nvn/vk: Mali/Xclipse GPU detected: R11G11B10F kept as RGBA16F to prevent green/purple/grey flickering");
+        log("nvn/vk: Mali/Xclipse GPU detected: R11G11B10F kept as RGBA16F to prevent flickering/blackouts");
         state.store(0, std::memory_order_release);
         return false;
     }
@@ -113,9 +124,7 @@ bool native_r11g11b10() {
                                       VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
     VkFormatProperties fp{};
     p_vkGetPhysicalDeviceFormatProperties(vk_physical(), VK_FORMAT_B10G11R11_UFLOAT_PACK32, &fp);
-    const char* emu = std::getenv("NX_R11G11B10_EMULATE");
-    const bool emulate = emu && emu[0] != '0';
-    bool on = (fp.optimalTilingFeatures & need) == need && !emulate;
+    bool on = (fp.optimalTilingFeatures & need) == need && !force_emulate;
     log("nvn/vk: R11G11B10F %s (format features %#x)", on ? "native (B10G11R11_UFLOAT)" : "as RGBA16F",
         unsigned(fp.optimalTilingFeatures));
 #else
@@ -136,7 +145,17 @@ bool native_d24s8() {
     if (s >= 0) return s == 1;
     if (!vk_physical()) return false;  // asked before the device exists: not decided yet
     const char* e = std::getenv("NX_D24S8");
-    const bool wanted = e && e[0] == '1';
+    const bool force = e && e[0] == '2';
+    const bool wanted = e && (e[0] == '1' || force);
+#if defined(__ANDROID__)
+    // Adreno keeps stencil separate (5 bytes either way), so D24S8 saves no memory on Adreno 6xx stock drivers;
+    // keep D32_SFLOAT_S8_UINT there to avoid Qualcomm Vulkan 1.1 GENERAL-layout D24S8 depth quirks (NX_D24S8=2 forces).
+    if (is_adreno_6xx_or_older() && !is_turnip() && !force) {
+        log("nvn/vk: Adreno 6xx stock driver detected: D24S8 kept as D32S8 for compatibility");
+        state.store(0, std::memory_order_release);
+        return false;
+    }
+#endif
     const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
                                       VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
     VkFormatProperties fp{};
@@ -151,15 +170,31 @@ bool native_d24s8() {
 // Image flags that keep Adreno's framebuffer compression (PHASE4.md G1a): MUTABLE_FORMAT only with a format list.
 // Android by default (NX_UBWC_FLAGS=0: every colour image mutable, as before); elsewhere NX_UBWC_FLAGS=1.
 bool ubwc_flags() {
-    static const bool on = [] {
-        const char* e = std::getenv("NX_UBWC_FLAGS");
+    static std::atomic<int> state{-1};
+    int s = state.load(std::memory_order_acquire);
+    if (s >= 0) return s == 1;
+    const char* e = std::getenv("NX_UBWC_FLAGS");
+    if (e) {
+        const bool on = e[0] == '1';
+        state.store(on ? 1 : 0, std::memory_order_release);
+        return on;
+    }
 #if defined(__ANDROID__)
-        return !(e && e[0] == '0');
+    if (!vk_physical()) return false;
+    // Adreno 6xx stock drivers, Turnip, and PowerVR can suffer tile/decompression corruption on GENERAL-layout render
+    // targets and format lists; disable UBWC flags there (reverting to safe MUTABLE_FORMAT on all colour images).
+    if (is_adreno_6xx_or_older() || is_turnip() || is_powervr()) {
+        log("nvn/vk: %s detected: UBWC format lists disabled to prevent tile corruption",
+            is_turnip() ? "Turnip" : is_powervr() ? "PowerVR" : "Adreno 6xx");
+        state.store(0, std::memory_order_release);
+        return false;
+    }
+    state.store(1, std::memory_order_release);
+    return true;
 #else
-        return e && e[0] == '1';
+    state.store(0, std::memory_order_release);
+    return false;
 #endif
-    }();
-    return on;
 }
 
 // The upload ring takes ~11 MB of CPU writes per course frame (copies and zero padding). Host-visible coherent memory

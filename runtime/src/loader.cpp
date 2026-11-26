@@ -52,14 +52,23 @@ thread_local const char* t_missing_name = nullptr;
 
 void log(const char* fmt, ...) {
 #if defined(__ANDROID__)
-    // Diagnostic build: runtime logging enabled by default to capture engine/GPU diagnostics.
-    // Set NX_ENABLE_LOG=0 to disable logging.
-    static const bool s_enabled = [] {
+    // Set NX_ENABLE_LOG=0 to disable ongoing session logging while still capturing the initial boot/GPU/Vulkan
+    // diagnostic header (first 220 lines, zero per-frame overhead during gameplay) so Export Logs always includes
+    // GPU, Vulkan driver version, extensions, and format capabilities.
+    static const bool s_full_log = [] {
         const char* e = std::getenv("NX_ENABLE_LOG");
         if (!e) return true;
         return e[0] != '0' && std::strcmp(e, "false") != 0;
     }();
-    if (!s_enabled) return;
+    static std::atomic<uint32_t> s_startup_lines{0};
+    constexpr uint32_t kStartupLines = 220;
+    bool final_startup_note = false;
+    if (!s_full_log) {
+        if (s_startup_lines.load(std::memory_order_relaxed) >= kStartupLines) return;
+        const uint32_t n = s_startup_lines.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n > kStartupLines) return;
+        final_startup_note = (n == kStartupLines);
+    }
 #endif
     char buf[2048];
     va_list ap;
@@ -94,6 +103,11 @@ void log(const char* fmt, ...) {
         }
         if (g_log_file) {
             std::fprintf(g_log_file, "%s\n", buf);
+#if defined(__ANDROID__)
+            if (final_startup_note) {
+                std::fprintf(g_log_file, "log: startup summary complete (NX_ENABLE_LOG=0; enable Debug logging in Launcher for full session log)\n");
+            }
+#endif
             std::fflush(g_log_file);
         }
     } else {

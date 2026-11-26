@@ -86,19 +86,21 @@ VkShaderStageFlags stage_bit(ShaderStage s) {
 
 // `kinds`: per vertex input location, 0 float or the integer kind of its attribute format (vertex_int_kind).
 // `unwritten`: fragment input locations the vertex stage does not write (default_unwritten_inputs).
-VkShaderModule module_of(const ShaderInfo* s, const uint8_t* kinds = nullptr, uint32_t unwritten = 0) {
-    static std::map<std::tuple<const ShaderInfo*, std::string, uint32_t>, VkShaderModule> cache;
+VkShaderModule module_of(const ShaderInfo* s, const uint8_t* kinds = nullptr, uint32_t unwritten = 0,
+                         uint32_t ufloat_outputs = 0) {
+    static std::map<std::tuple<const ShaderInfo*, std::string, uint32_t, uint32_t>, VkShaderModule> cache;
     // The integer-vertex-input patch (skinned models' bone indices; without it Metal refuses every character's
     // pipeline, DEBUG.md #25/#26). NX_INT_ATTRIBS=0 turns it off.
     static const char* int_env = std::getenv("NX_INT_ATTRIBS");
     static const bool off = int_env && int_env[0] == '0';
     std::string k = kinds && !off ? std::string(reinterpret_cast<const char*>(kinds), 16) : std::string(16, '\0');
-    auto& m = cache[{s, k, unwritten}];
+    const uint32_t ufo = s->stage == ShaderStage::Fragment ? ufloat_outputs : 0u;
+    auto& m = cache[{s, k, unwritten, ufo}];
     if (!m) {
         const uint64_t module_t0 = plat::monotonic_ns();
         bool is_patched = false;
         const uint8_t* int_kinds = k != std::string(16, '\0') ? reinterpret_cast<const uint8_t*>(k.data()) : nullptr;
-        std::vector<uint32_t> code = patched_spirv(s, int_kinds, unwritten, &is_patched);
+        std::vector<uint32_t> code = patched_spirv(s, int_kinds, unwritten, &is_patched, ufo);
         if (s->stage == ShaderStage::Vertex && uw_on()) {  // NX_ULTRAWIDE: gl_Position.x * spec constant 0
             std::vector<uint32_t> scaled;
             if (patch_x_scale(code, scaled)) code.swap(scaled);
@@ -466,13 +468,13 @@ Pool& pool() {
         auto* pl = new Pool;
         const char* e = std::getenv("NX_PIPE_THREADS");
         unsigned hw = std::thread::hardware_concurrency();
-        unsigned n = e ? unsigned(std::atoi(e)) : std::min(4u, hw > 2 ? std::max(2u, hw / 2) : 1u);
+        unsigned n = e ? unsigned(std::atoi(e))
+                       : (is_powervr() ? 1u : std::min(4u, hw > 2 ? std::max(2u, hw / 2) : 1u));
         pl->threads = std::min(n, 8u);
         for (unsigned i = 0; i < pl->threads; i++)
             std::thread([pl] {
                 t_worker = true;
                 plat::set_thread_name("pipe-worker");
-                plat::pin_current_thread_to_little_cores("pipe-worker");
                 plat::set_thread_priority(0);
                 for (;;) {
                     std::shared_ptr<PipeTask> t;
@@ -601,19 +603,26 @@ PKey bytes_of(const PipelineKey& k) {
 //   2 (Android default): smart safe async — shadows, early boot, fullscreen quads, bloom mips, cubemaps,
 //      and unrendered offscreen bakes stay synchronous; world/character/battle VFX compile on workers.
 int async_pipelines_mode() {
-    static const int mode = [] {
-        if (const char* e = std::getenv("NX_ASYNC_PIPELINES")) {
-            if (e[0] == '0') return 0;
-            if (e[0] == '1') return 1;
-            if (e[0] == '2') return 2;
-        }
+    static std::atomic<int> cached{-1};
+    int m = cached.load(std::memory_order_acquire);
+    if (m >= 0) return m;
+    if (const char* e = std::getenv("NX_ASYNC_PIPELINES")) {
+        int v = e[0] == '0' ? 0 : (e[0] == '1' ? 1 : 2);
+        cached.store(v, std::memory_order_release);
+        return v;
+    }
+    if (!vk_physical()) return 0;
 #if defined(__ANDROID__)
-        return 2;
+    // PowerVR BXM compiles pipelines slowly (especially without cache on unused-slot passes), so async draw skipping
+    // leaves models/textures popping in and out for many frames; compile synchronously there unless overridden.
+    const int v = is_powervr() ? 0 : 2;
+    if (is_powervr()) log("nvn/vk: PowerVR detected: synchronous pipeline compilation enabled (no skipped draws)");
+    cached.store(v, std::memory_order_release);
+    return v;
 #else
-        return 0;
+    cached.store(0, std::memory_order_release);
+    return 0;
 #endif
-    }();
-    return mode;
 }
 
 bool should_async_compile(bool allow_async) {
@@ -913,12 +922,17 @@ std::unique_ptr<PipeBuild> prepare_graphics_pipeline(const PipelineKey& key, con
         log("nvn/vk: vs %s inputs (location:format/stream+offset)%s", key.vs->hash.c_str(), line.c_str());
     }
     uint32_t unwritten = unwritten_inputs(key.vs, key.fs);
+    uint32_t ufloat_outputs = 0;
+    for (uint32_t k = 0; k < key.color_count && k < 8; k++) {
+        if (key.color_formats[k] == VK_FORMAT_B10G11R11_UFLOAT_PACK32) ufloat_outputs |= 1u << k;
+    }
     for (const ShaderInfo* s : {key.vs, key.fs}) {
         if (!s) continue;
         auto& st = stages[nstages++];
         st.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         st.stage = VkShaderStageFlagBits(stage_bit(s->stage));
-        st.module = module_of(s, s == key.vs ? int_kinds : nullptr, s == key.fs ? unwritten : 0);
+        st.module = module_of(s, s == key.vs ? int_kinds : nullptr, s == key.fs ? unwritten : 0,
+                              s == key.fs ? ufloat_outputs : 0u);
         st.pName = "main";
         if (s == key.vs && key.uw_x > 0) {  // NX_ULTRAWIDE: constant 0 of the patched vertex module
             static VkSpecializationMapEntry entry{0, 0, sizeof(float)};
@@ -1341,12 +1355,7 @@ GpuImage* ensure_contents(VkCommandBuffer cb, uint64_t texture) {
     if (upload) upload_texture(cb, *t, *img, img->uploaded && dirty ? dirty_lo : 0, img->uploaded && dirty ? dirty_hi : UINT64_MAX);
     apply_texel_writes(cb, *t, *img);
     if (img->layout == VK_IMAGE_LAYOUT_UNDEFINED) {  // never written: black, not garbage
-        transition(cb, *img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        VkImageSubresourceRange r{img->aspect, 0, img->levels, 0, img->layers};
-        if (img->aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
-            VkClearColorValue v{};
-            p_vkCmdClearColorImage(cb, img->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
-        }
+        clear_image(cb, *img);
     }
     return img;
 }

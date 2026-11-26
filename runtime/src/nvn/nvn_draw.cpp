@@ -66,16 +66,27 @@ uint64_t g_pass_serial = 0, g_vertex_visible_at = 0;  // pass ends so far; the s
 uint64_t g_vertex_barriers = 0;
 
 // Narrow pass barrier: allows Mali Valhall GPUs to overlap next pass vertex binning with previous pass fragment shading.
+// Disabled by default on PowerVR TBDR GPUs (where full ALL_COMMANDS pass barriers prevent flashing/overlapping tiles).
 bool narrow_pass_barrier() {
+    static std::atomic<int> state{-1};
+    int s = state.load(std::memory_order_acquire);
+    if (s >= 0) return s == 1;
+    const char* e = std::getenv("NX_PASS_BARRIER_NARROW");
+    if (e) {
+        const bool on = e[0] != '0';
+        state.store(on ? 1 : 0, std::memory_order_release);
+        return on;
+    }
+    if (!vk_physical()) return false;
 #if defined(__ANDROID__)
-    static const bool on = [] {
-        const char* e = std::getenv("NX_PASS_BARRIER_NARROW");
-        return !(e && e[0] == '0');
-    }();
-#else
-    static const bool on = std::getenv("NX_PASS_BARRIER_NARROW") != nullptr;
-#endif
+    const bool on = !is_powervr();
+    if (!on) log("nvn/vk: PowerVR detected: using full ALL_COMMANDS pass barriers");
+    state.store(on ? 1 : 0, std::memory_order_release);
     return on;
+#else
+    state.store(0, std::memory_order_release);
+    return false;
+#endif
 }
 
 // A vertex shader sampling a rendered image after a narrow pass-end barrier: the pass ends (it cannot take a barrier
@@ -96,6 +107,9 @@ bool g_pass_hint_valid = false;
 bool g_pass_hint_reads_depth = true;
 bool g_pass_hint_writes_depth = true;
 bool g_pass_hint_uses_stencil = true;
+bool g_pass_depth_load_ok = true;
+bool g_pass_depth_store_ok = true;
+bool g_pass_stencil_ok = true;
 uint64_t g_depth_store_none = 0;
 uint64_t g_stencil_store_none = 0;
 uint64_t g_depth_load_none = 0;
@@ -306,11 +320,28 @@ void pass_census(const Targets& t, const VkRenderingAttachmentInfo* colors, cons
 }
 
 bool crop_render_area_on() {
-    static const bool on = [] {
-        const char* e = std::getenv("NX_CROP_RENDER_AREA");
-        return !e || e[0] != '0';
-    }();
-    return on;
+    static std::atomic<int> state{-1};
+    int s = state.load(std::memory_order_acquire);
+    if (s >= 0) return s == 1;
+    const char* e = std::getenv("NX_CROP_RENDER_AREA");
+    if (e) {
+        const bool on = e[0] != '0';
+        state.store(on ? 1 : 0, std::memory_order_release);
+        return on;
+    }
+    if (!vk_physical()) return false;
+#if defined(__ANDROID__)
+    // Qualcomm stock Adreno 6xx and PowerVR TBDR drivers can drop/corrupt tile stores when renderArea is cropped
+    // smaller than the framebuffer extent (e.g. Dread's 1600x900 3D targets cropped to 1280x720).
+    if ((is_adreno_6xx_or_older() && !is_turnip()) || is_powervr()) {
+        log("nvn/vk: %s detected: partial renderArea crop disabled",
+            is_powervr() ? "PowerVR" : "Adreno 6xx stock driver");
+        state.store(0, std::memory_order_release);
+        return false;
+    }
+#endif
+    state.store(1, std::memory_order_release);
+    return true;
 }
 
 bool draw_bounds_fit(VkExtent2D limit, bool is_low_3d) {
@@ -419,20 +450,43 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t, bool allow_crop = fal
     stencil.storeOp = g_shadow_target ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
     uint32_t cleared = clears_apply(t, colors, depth, stencil);  // pending clears of these targets: loadOp CLEAR
     if (use_hint && dimg && !(fresh & (1u << 8))) {
-        if (!hint_writes_depth && depth.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
-            depth.storeOp = VK_ATTACHMENT_STORE_OP_NONE;
-            g_depth_store_none++;
-            if (!hint_reads_depth && depth.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
-                depth.loadOp = kLoadOpNone;
-                g_depth_load_none++;
+        const bool packed_ds = (dimg->format == VK_FORMAT_D24_UNORM_S8_UINT ||
+                                dimg->format == VK_FORMAT_D16_UNORM_S8_UINT);
+        if (packed_ds) {
+            // Packed D24S8 shares one 32-bit word per pixel in tile memory: loading/storing one aspect already
+            // transfers the full 32-bit word (zero extra bandwidth), whereas mixing depth LOAD/STORE with stencil
+            // LOAD_OP_NONE/STORE_OP_NONE corrupts the packed stencil byte on older Mali Valhall drivers (r32-r38),
+            // dropping stencil-tested geometry passes (e.g. Dread's cave/environment G-Buffer) to black.
+            if (!hint_writes_depth && !hint_uses_stencil &&
+                depth.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR && stencil.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
+                depth.storeOp = VK_ATTACHMENT_STORE_OP_NONE;
+                stencil.storeOp = VK_ATTACHMENT_STORE_OP_NONE;
+                g_depth_store_none++;
+                g_stencil_store_none++;
+                if (!hint_reads_depth &&
+                    depth.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD && stencil.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+                    depth.loadOp = kLoadOpNone;
+                    stencil.loadOp = kLoadOpNone;
+                    g_depth_load_none++;
+                    g_stencil_load_none++;
+                }
             }
-        }
-        if (!hint_uses_stencil && stencil.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
-            stencil.storeOp = VK_ATTACHMENT_STORE_OP_NONE;
-            g_stencil_store_none++;
-            if (stencil.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
-                stencil.loadOp = kLoadOpNone;
-                g_stencil_load_none++;
+        } else {
+            if (!hint_writes_depth && depth.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
+                depth.storeOp = VK_ATTACHMENT_STORE_OP_NONE;
+                g_depth_store_none++;
+                if (!hint_reads_depth && depth.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+                    depth.loadOp = kLoadOpNone;
+                    g_depth_load_none++;
+                }
+            }
+            if (!hint_uses_stencil && stencil.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
+                stencil.storeOp = VK_ATTACHMENT_STORE_OP_NONE;
+                g_stencil_store_none++;
+                if (stencil.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+                    stencil.loadOp = kLoadOpNone;
+                    g_stencil_load_none++;
+                }
             }
         }
     }
@@ -491,6 +545,9 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t, bool allow_crop = fal
         p_vkCmdBeginRendering(cb, &ri);
     g_rendering = true;
     g_pass_cb = cb;
+    g_pass_depth_load_ok = !dimg || depth.loadOp != kLoadOpNone;
+    g_pass_depth_store_ok = !dimg || depth.storeOp != VK_ATTACHMENT_STORE_OP_NONE;
+    g_pass_stencil_ok = !dimg || (stencil.loadOp != kLoadOpNone && stencil.storeOp != VK_ATTACHMENT_STORE_OP_NONE);
     g_pass_written = cleared | fresh;  // as a clear inside the pass: sampling it needs it stored first
     g_pass_draws = 0;
     s_pass_linear_noted = false;
@@ -505,12 +562,13 @@ uint64_t g_dump_draws = 0, g_dump_request = 0;
 // The graphics stages bound now: one program for all of them (its own list), or a vertex and a fragment program
 // bound separately (their stages gathered in `out`).
 uint64_t g_bound_pv = 0, g_bound_pf = 0, g_bound_prog_gen = 0;
+const std::vector<const ShaderInfo*>* g_bound_out = nullptr;
 const std::vector<const ShaderInfo*>* bound_graphics_shaders(std::vector<const ShaderInfo*>& out) {
     const uint64_t pv = g_state.stage_programs[0], pf = g_state.stage_programs[1];
     if (!pv && !pf) return nullptr;
     if (pv == pf) return program_shaders(pv);
     const uint64_t cur_pgen = program_generation();
-    if (g_bound_prog_gen == cur_pgen && g_bound_pv == pv && g_bound_pf == pf && !out.empty())
+    if (g_bound_out == &out && g_bound_prog_gen == cur_pgen && g_bound_pv == pv && g_bound_pf == pf && !out.empty())
         return &out;
     out.clear();
     if (const auto* sh = program_shaders(pv))
@@ -519,7 +577,7 @@ const std::vector<const ShaderInfo*>* bound_graphics_shaders(std::vector<const S
     if (const auto* sh = program_shaders(pf))
         for (const ShaderInfo* s : *sh)
             if (s->stage == ShaderStage::Fragment) out.push_back(s);
-    g_bound_pv = pv, g_bound_pf = pf, g_bound_prog_gen = cur_pgen;
+    g_bound_pv = pv, g_bound_pf = pf, g_bound_prog_gen = cur_pgen, g_bound_out = &out;
     return &out;
 }
 
@@ -1486,6 +1544,13 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         need_break = true;
         g_crop_breaks++;
     }
+    if (g_rendering && !targets_changed && tt.depth != 0) {
+        if ((g_state.depth.depth_test && !g_pass_depth_load_ok) ||
+            (g_state.depth.depth_write && !g_pass_depth_store_ok) ||
+            (g_state.depth.stencil_test && !g_pass_stencil_ok)) {
+            need_break = true;
+        }
+    }
     if (used_detached) {
         s_pass_targets_ver = 0;
     } else if (!targets_changed) {
@@ -1780,8 +1845,10 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
             auto is_async_safe_draw = [&]() -> bool {
                 if (g_frame.load(std::memory_order_relaxed) < 90) return false;
                 if (!fs || depth_only(tt)) return false;
-                const uint32_t vcount = indexed ? uint32_t(c.i[0]) : uint32_t(c.i[1]);
-                if (!g_state.depth.depth_test && !g_state.depth.depth_write && vcount <= 6) return false;
+                // Keep all 2D/UI/menu draws (multi-quad batches too) and short-lived transparent VFX (e.g. enemy
+                // death explosions/dissolves) synchronous so menus never flash and death effects are never skipped.
+                if (!g_state.depth.depth_test && !g_state.depth.depth_write) return false;
+                if (!g_state.depth.depth_write && g_state.color.blend_enable[0]) return false;
                 if (tt.views.level[0] > 0) return false;
                 if (s_pass_fresh_bake) return false;
                 GpuImage* c0 = tt.color_count && tt.colors[0] ? image_of(tt.colors[0]) : nullptr;
@@ -2248,6 +2315,12 @@ void pass_set_ds_store_hint(bool reads_depth, bool writes_depth, bool uses_stenc
     g_pass_hint_uses_stencil = uses_stencil;
 }
 void pass_clear_ds_store_hint() { g_pass_hint_valid = false; }
+bool pass_ds_writable(VkImageAspectFlags aspect) {
+    if (!g_rendering) return true;
+    if ((aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && !g_pass_depth_store_ok) return false;
+    if ((aspect & VK_IMAGE_ASPECT_STENCIL_BIT) && !g_pass_stencil_ok) return false;
+    return true;
+}
 // After a clear inside the pass (nvn_clears.cpp). A masked one is a fullscreen draw with its own pipeline, viewport
 // and scissor (nvn_mask_clear.cpp): the next draw sets everything again.
 void pass_mark_written(uint32_t bits) { g_pass_written |= bits, g_bound = Bound{}, sets_invalidate_bound(); }

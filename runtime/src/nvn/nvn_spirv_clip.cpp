@@ -123,7 +123,7 @@ bool depth_remap() {
         return !e ? -1 : (e[0] == '1' ? 1 : 0);
     }();
     if (env >= 0) return env > 0;
-    return vk_physical() && !vk_depth_clip_control();
+    return vk_physical() && (!vk_depth_clip_control() || (is_adreno_6xx_or_older() && !is_turnip()));
 }
 
 void clip_z_module(const ShaderInfo* s, std::vector<uint32_t>& code) {

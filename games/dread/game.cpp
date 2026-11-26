@@ -27,7 +27,7 @@ const game::Info game::kInfo = {
     "49161D9CCBC15DF9" /* Base 1.0.0 */
 };
 
-static constexpr const char* kPerfBuildTag = "v0.1.0-beta.1";
+static constexpr const char* kPerfBuildTag = "v0.1.0-beta.2";
 
 namespace {
 

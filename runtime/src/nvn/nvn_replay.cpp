@@ -73,7 +73,7 @@ struct DsHintState {
     bool writes_depth = false;
     bool uses_stencil = false;
     bool exited_pass = false;
-    int budget = 256;
+    int budget = 4096;
 };
 
 static void scan_list_ds_hint(const CmdList& list, size_t start_idx, int call_depth, const Targets& st,
@@ -127,13 +127,13 @@ static void scan_list_ds_hint(const CmdList& list, size_t start_idx, int call_de
     }
 }
 
-static void scan_ds_store_hint(const CmdList& list, size_t idx, int depth, const Targets& st) {
+static void scan_ds_store_hint(const CmdList& list, size_t idx, int depth, bool more_lists, const Targets& st) {
     DsHintState s;
     s.reads_depth = replay::g_state.depth.depth_test != 0;
     s.writes_depth = replay::g_state.depth.depth_write != 0;
     s.uses_stencil = replay::g_state.depth.stencil_test != 0;
     scan_list_ds_hint(list, idx + 1, 0, st, s);
-    if (!s.exited_pass && depth > 0) {
+    if (!s.exited_pass && (depth > 0 || more_lists)) {
         s.reads_depth = true;
         s.writes_depth = true;
         s.uses_stencil = true;
@@ -141,7 +141,7 @@ static void scan_ds_store_hint(const CmdList& list, size_t idx, int depth, const
     pass_set_ds_store_hint(s.reads_depth, s.writes_depth, s.uses_stencil);
 }
 
-void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth) {
+void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth, bool more_lists) {
     if (skin_lists_on()) skin_list_replayed(list, depth);
     for (size_t idx = 0; idx < list.cmds.size(); idx++) {
         const Cmd& c = list.cmds[idx];
@@ -172,7 +172,7 @@ void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth
             case Cmd::CallList:
                 if (depth < 8) {
                     if (auto l = submit_command_list(c.a[0])) {
-                        replay_list(cb, st, *l, depth + 1);
+                        replay_list(cb, st, *l, depth + 1, more_lists || (idx + 1 < list.cmds.size()));
                         cb = frame_cb(cb);  // NX_PIPELINED: the called list may have split the submit
                     } else {
                         static uint64_t missing = 0;
@@ -220,7 +220,7 @@ void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth
             default: {
                 const bool hinted = (c.op == Cmd::DrawArrays || c.op == Cmd::DrawElements) && !pass_open_on(st) &&
                                     st.depth != 0 && vk_load_store_op_none();
-                if (hinted) scan_ds_store_hint(list, idx, depth, st);
+                if (hinted) scan_ds_store_hint(list, idx, depth, more_lists, st);
                 draw_command(cb, c, list, st);
                 if (hinted) pass_clear_ds_store_hint();
                 // NX_PIPELINED: after the submit's last dispatch the rest goes into a second command buffer.

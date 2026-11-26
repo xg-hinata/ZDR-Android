@@ -161,8 +161,13 @@ bool init() {
     g_device_props = props;
     if (is_xclipse()) log("nvn/vk: Samsung Xclipse GPU detected (forcing CPU BC texture decode for compatibility)");
     if (is_mali()) log("nvn/vk: ARM Mali GPU detected");
+    if (is_turnip())
+        log("nvn/vk: Mesa Turnip driver detected (disabling UBWC format lists for compatibility)");
+    else if (is_adreno_6xx_or_older())
+        log("nvn/vk: Qualcomm Adreno 6xx stock driver detected (safe RGBA16F HDR, D32S8 depth, clip-z remap, UBWC flags and partial renderArea crop disabled)");
     if (is_adreno_8xx()) log("nvn/vk: Qualcomm Adreno 8xx GPU detected (disabling chunked submits to avoid battle hang)");
-    if (is_powervr()) log("nvn/vk: PowerVR GPU detected (pipelines with an unused colour slot skip the pipeline cache)");
+    if (is_powervr())
+        log("nvn/vk: PowerVR GPU detected (safe RGBA16F HDR, full pass barriers, sync pipelines, UBWC/crop/EDS3 disabled, unused-slot cache skip)");
     p_vkGetPhysicalDeviceMemoryProperties(g_physical, &g_memory);
 #if defined(__ANDROID__)
     // All Android mobile SoCs (Mali, Adreno, PowerVR) share system memory with the CPU.
@@ -662,6 +667,20 @@ bool is_mali() {
 bool is_adreno() {
     return std::strstr(g_device_props.deviceName, "Adreno") != nullptr || g_device_props.vendorID == 0x5143;
 }
+bool is_turnip() {
+    std::string name = g_device_props.deviceName;
+    for (char& c : name) c = std::tolower(static_cast<unsigned char>(c));
+    return name.find("turnip") != std::string::npos || name.find("freedreno") != std::string::npos ||
+           name.find("purplevk") != std::string::npos;
+}
+bool is_adreno_6xx_or_older() {
+    std::string name = g_device_props.deviceName;
+    for (char& c : name) c = std::tolower(static_cast<unsigned char>(c));
+    size_t pos = name.find("adreno");
+    if (pos == std::string::npos) return false;
+    while (pos < name.size() && !std::isdigit(static_cast<unsigned char>(name[pos]))) pos++;
+    return pos < name.size() && name[pos] >= '1' && name[pos] <= '6';
+}
 bool is_powervr() {
     return std::strstr(g_device_props.deviceName, "PowerVR") != nullptr || g_device_props.vendorID == 0x1010;
 }
@@ -864,7 +883,7 @@ void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_
     const FrameTimes f0 = frame_times();
     Targets st;
     for (size_t k = 0; k < lists.size(); k++) {
-        replay_list(g_cb, st, *lists[k], 0);
+        replay_list(g_cb, st, *lists[k], 0, k + 1 < lists.size());
         // After the last list with a dispatch, unless nothing follows it (replay_list may have split inside a list).
         g_cb = k == split_after && k + 1 < lists.size() ? frame_split(g_cb) : frame_cb(g_cb);
     }

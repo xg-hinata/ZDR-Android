@@ -110,6 +110,18 @@ VkFormat vk_format(uint32_t f) {
     if (f >= 0x79 && f <= 0x86) return astc_decoded(f) ? VK_FORMAT_R8G8B8A8_UNORM : kAstc[f - 0x79];
     if (f >= 0x87 && f <= 0x94) return astc_decoded(f) ? VK_FORMAT_R8G8B8A8_SRGB : kAstcSrgb[f - 0x87];
     switch (f) {
+        case 0x6d: return VK_FORMAT_R8G8B8A8_UNORM;       // RGBX8
+        case 0x6e: return VK_FORMAT_R8G8B8A8_SNORM;       // RGBX8SN
+        case 0x6f: return VK_FORMAT_R8G8B8A8_UINT;        // RGBX8UI
+        case 0x70: return VK_FORMAT_R8G8B8A8_SINT;        // RGBX8I
+        case 0x71: return VK_FORMAT_R16G16B16A16_SFLOAT;  // RGBX16F
+        case 0x72: return VK_FORMAT_R16G16B16A16_UNORM;   // RGBX16
+        case 0x73: return VK_FORMAT_R16G16B16A16_SNORM;   // RGBX16SN
+        case 0x74: return VK_FORMAT_R16G16B16A16_UINT;    // RGBX16UI
+        case 0x75: return VK_FORMAT_R16G16B16A16_SINT;    // RGBX16I
+        case 0x76: return VK_FORMAT_R32G32B32A32_SFLOAT;  // RGBX32F
+        case 0x77: return VK_FORMAT_R32G32B32A32_UINT;    // RGBX32UI
+        case 0x78: return VK_FORMAT_R32G32B32A32_SINT;    // RGBX32I
         case 0x95: return VK_FORMAT_B5G6R5_UNORM_PACK16;
         case 0x96:
         case 0x97: return VK_FORMAT_B5G5R5A1_UNORM_PACK16;

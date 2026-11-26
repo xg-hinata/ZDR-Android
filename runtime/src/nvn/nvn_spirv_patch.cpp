@@ -12,6 +12,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "nvn_pipeline.h"
@@ -783,7 +784,141 @@ bool inject_fp16_relaxed_precision_mali(const std::vector<uint32_t>& in, std::ve
     return true;
 }
 
-std::vector<uint32_t> patched_spirv(const ShaderInfo* s, const uint8_t* kinds, uint32_t unwritten, bool* int_inputs) {
+// Clamp fragment shader stores to B10G11R11_UFLOAT render targets with GLSL.std.450 NClamp(0, 64512).
+// Mali, Xclipse, and PowerVR drivers can encode negative/NaN/Inf outputs into B10G11R11_UFLOAT as NaN/Inf,
+// which then spreads across bloom/post-process passes as black glitches or flickering.
+bool clamp_ufloat_fragment_outputs(const std::vector<uint32_t>& in, uint32_t ufloat_mask, std::vector<uint32_t>& out) {
+    enum : uint32_t {
+        OpExtInstImport = 11, OpExtInst = 12, OpMemoryModel = 14, OpEntryPointOp = 15, OpConstant = 43,
+        OpConstantComposite = 44, OpStore = 62, StorageOutput = 3, ModelFragment = 4, GlslNClamp = 81,
+    };
+    if (in.size() < 5 || !ufloat_mask) return false;
+
+    std::vector<Inst> insts;
+    for (size_t i = 5; i < in.size();) {
+        uint32_t len = in[i] >> 16;
+        if (!len || i + len > in.size()) return false;
+        insts.push_back({i, in[i] & 0xffff, len});
+        i += len;
+    }
+
+    uint32_t glsl_id = 0, f32 = 0, v3f = 0, v4f = 0, ptr_f32 = 0, ptr_v3f = 0, ptr_v4f = 0;
+    bool is_fragment = false;
+    size_t first_function = in.size(), mem_model_at = in.size();
+    std::unordered_map<uint32_t, uint32_t> location;
+    for (const Inst& n : insts) {
+        const uint32_t* w = &in[n.at];
+        if (n.op == OpExtInstImport && n.len >= 3 &&
+            std::strcmp(reinterpret_cast<const char*>(w + 2), "GLSL.std.450") == 0) {
+            glsl_id = w[1];
+        } else if (n.op == OpMemoryModel && mem_model_at == in.size()) {
+            mem_model_at = n.at;
+        } else if (n.op == OpEntryPointOp && n.len >= 3) {
+            is_fragment |= (w[1] == ModelFragment);
+        } else if (n.op == OpDecorate && n.len >= 4 && w[2] == DecorationLocation) {
+            location[w[1]] = w[3];
+        } else if (n.op == OpTypeFloat && n.len == 3 && w[2] == 32) {
+            f32 = w[1];
+        } else if (n.op == OpTypeVector && n.len == 4 && f32 && w[2] == f32) {
+            if (w[3] == 3) v3f = w[1];
+            else if (w[3] == 4) v4f = w[1];
+        } else if (n.op == OpTypePointer && n.len == 4 && w[2] == StorageOutput) {
+            if (f32 && w[3] == f32) ptr_f32 = w[1];
+            else if (v3f && w[3] == v3f) ptr_v3f = w[1];
+            else if (v4f && w[3] == v4f) ptr_v4f = w[1];
+        } else if (n.op == OpFunction) {
+            first_function = std::min(first_function, n.at);
+        }
+    }
+    if (!is_fragment || !f32 || first_function == in.size() || (!glsl_id && mem_model_at == in.size())) return false;
+
+    // ptr id -> component count (1 = scalar f32, 3 = vec3, 4 = vec4)
+    std::unordered_map<uint32_t, uint8_t> out_ptrs;
+    bool need_vec3 = false, need_vec4 = false, any_store = false;
+    for (const Inst& n : insts) {
+        const uint32_t* w = &in[n.at];
+        if (n.op == OpVariable && n.len >= 4 && w[3] == StorageOutput) {
+            uint8_t comps = 0;
+            if (ptr_v4f && w[1] == ptr_v4f) comps = 4;
+            else if (ptr_v3f && w[1] == ptr_v3f) comps = 3;
+            else if (ptr_f32 && w[1] == ptr_f32) comps = 1;
+            if (!comps) continue;
+            auto lit = location.find(w[2]);
+            if (lit == location.end() || lit->second >= 8 || !((ufloat_mask >> lit->second) & 1u)) continue;
+            out_ptrs[w[2]] = comps;
+        } else if ((n.op == OpAccessChain || n.op == OpInBoundsAccessChain) && n.len >= 5) {
+            auto pit = out_ptrs.find(w[3]);
+            if (pit != out_ptrs.end() && pit->second > 1) out_ptrs[w[2]] = 1;
+        } else if (n.op == OpStore && n.len >= 3) {
+            auto pit = out_ptrs.find(w[1]);
+            if (pit != out_ptrs.end()) {
+                any_store = true;
+                need_vec3 |= (pit->second == 3);
+                need_vec4 |= (pit->second == 4);
+            }
+        }
+    }
+    if (!any_store) return false;
+
+    uint32_t bound = in[3];
+    const bool inject_glsl = (glsl_id == 0);
+    if (inject_glsl) glsl_id = bound++;
+    const uint32_t c_zero_f = bound++;
+    const uint32_t c_max_f = bound++;
+    uint32_t c_zero_v3 = 0, c_max_v3 = 0, c_zero_v4 = 0, c_max_v4 = 0;
+    std::vector<uint32_t> consts;
+    consts.insert(consts.end(), {
+        (4u << 16) | OpConstant, f32, c_zero_f, 0x00000000u,  // 0.0f
+        (4u << 16) | OpConstant, f32, c_max_f, 0x477C0000u,   // 64512.0f (max finite 10-bit B in B10G11R11_UFLOAT)
+    });
+    if (need_vec3 && v3f) {
+        c_zero_v3 = bound++;
+        c_max_v3 = bound++;
+        consts.insert(consts.end(), {
+            (6u << 16) | OpConstantComposite, v3f, c_zero_v3, c_zero_f, c_zero_f, c_zero_f,
+            (6u << 16) | OpConstantComposite, v3f, c_max_v3, c_max_f, c_max_f, c_max_f,
+        });
+    }
+    if (need_vec4 && v4f) {
+        c_zero_v4 = bound++;
+        c_max_v4 = bound++;
+        consts.insert(consts.end(), {
+            (7u << 16) | OpConstantComposite, v4f, c_zero_v4, c_zero_f, c_zero_f, c_zero_f, c_zero_f,
+            (7u << 16) | OpConstantComposite, v4f, c_max_v4, c_max_f, c_max_f, c_max_f, c_max_f,
+        });
+    }
+
+    out.clear();
+    out.reserve(in.size() + consts.size() + 40);
+    out.assign(in.begin(), in.begin() + 5);
+    for (const Inst& n : insts) {
+        if (inject_glsl && n.at == mem_model_at) {
+            out.insert(out.end(), {(6u << 16) | OpExtInstImport, glsl_id, 0x4c534c47u, 0x6474732eu, 0x3035342eu, 0u});
+        }
+        if (n.at == first_function) out.insert(out.end(), consts.begin(), consts.end());
+        if (n.op == OpStore && n.len >= 3) {
+            auto pit = out_ptrs.find(in[n.at + 1]);
+            if (pit != out_ptrs.end()) {
+                const uint8_t comps = pit->second;
+                const uint32_t ty = comps == 4 ? v4f : (comps == 3 ? v3f : f32);
+                const uint32_t lo = comps == 4 ? c_zero_v4 : (comps == 3 ? c_zero_v3 : c_zero_f);
+                const uint32_t hi = comps == 4 ? c_max_v4 : (comps == 3 ? c_max_v3 : c_max_f);
+                const uint32_t clamped = bound++;
+                out.insert(out.end(), {(8u << 16) | OpExtInst, ty, clamped, glsl_id, GlslNClamp, in[n.at + 2], lo, hi});
+                std::vector<uint32_t> w(in.begin() + long(n.at), in.begin() + long(n.at + n.len));
+                w[2] = clamped;
+                out.insert(out.end(), w.begin(), w.end());
+                continue;
+            }
+        }
+        out.insert(out.end(), in.begin() + long(n.at), in.begin() + long(n.at + n.len));
+    }
+    out[3] = bound;
+    return true;
+}
+
+std::vector<uint32_t> patched_spirv(const ShaderInfo* s, const uint8_t* kinds, uint32_t unwritten, bool* int_inputs,
+                                    uint32_t ufloat_outputs) {
     std::vector<uint32_t> code = s->spirv, next;  // each pass reads `code` and leaves its result in `next`
     if (strip_interlock(code, next)) code.swap(next);
     bool is_int = kinds && patch_int_inputs(code, kinds, next);
@@ -857,6 +992,18 @@ std::vector<uint32_t> patched_spirv(const ShaderInfo* s, const uint8_t* kinds, u
         static int fp16_logs = 0;
         if (fp16_logs++ < 10) log("nvn/vk: shader %s (%s): injected FP16 RelaxedPrecision decorations",
                                   s->hash.c_str(), is_bloom_postfx ? "bloom/postfx" : "general");
+    }
+    static const bool ufloat_clamp_on = [] {
+        const char* e = std::getenv("NX_UFLOAT_CLAMP");
+        return !(e && e[0] == '0');
+    }();
+    if (ufloat_clamp_on && s->stage == ShaderStage::Fragment && ufloat_outputs &&
+        clamp_ufloat_fragment_outputs(code, ufloat_outputs, next)) {
+        code.swap(next);
+        static int ufloat_logs = 0;
+        if (ufloat_logs++ < 10)
+            log("nvn/vk: shader %s: clamped B10G11R11_UFLOAT output(s) %#x with NClamp(0, 64512)",
+                s->hash.c_str(), ufloat_outputs);
     }
     return code;
 }
